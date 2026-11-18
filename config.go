@@ -78,6 +78,38 @@ type Config struct {
 	// at the expense of increased bandwidth.
 	RetransmitMult int
 
+	// BroadcastRetransmitBackoff is the base delay applied before a broadcast
+	// becomes eligible for retransmission. The delay doubles after each
+	// additional retransmission, up to BroadcastMaxRetransmitBackoff. The first
+	// BroadcastRetransmitFanout transmissions are not delayed.
+	//
+	// This controls local queue scheduling only. It does not change the
+	// RetransmitMult limit or the wire format of a broadcast.
+	BroadcastRetransmitBackoff time.Duration
+
+	// BroadcastMaxRetransmitBackoff caps the exponential retransmission
+	// backoff. A zero value uses 16 times BroadcastRetransmitBackoff.
+	BroadcastMaxRetransmitBackoff time.Duration
+
+	// BroadcastRetransmitFanout is the number of immediate transmissions
+	// allowed for a message before backoff starts. A zero value uses
+	// GossipNodes.
+	BroadcastRetransmitFanout int
+
+	// BroadcastMessageTTL is the maximum amount of time a message may remain
+	// in the broadcast queue. Messages older than this are dropped and their
+	// Finished callbacks are invoked. A zero value disables expiration.
+	//
+	// This keeps stale membership updates from occupying the queue during
+	// sustained packet loss. It does not alter the message contents or the
+	// RetransmitMult limit.
+	BroadcastMessageTTL time.Duration
+
+	// BroadcastQueueWarnDepth enables a periodic warning when the broadcast
+	// queue depth is at or above this value. A zero value disables the warning.
+	// Queue depth is still exported through metrics when warnings are disabled.
+	BroadcastQueueWarnDepth int
+
 	// SuspicionMult is the multiplier for determining the time an
 	// inaccessible node is considered suspect before declaring it dead.
 	// The actual timeout is calculated using the formula:
@@ -257,8 +289,9 @@ type Config struct {
 	// MetricLabels is a map of optional labels to apply to all metrics emitted.
 	MetricLabels []metrics.Label
 
-	// QueueCheckInterval is the interval at which we check the message
-	// queue to apply the warning and max depth.
+	// QueueCheckInterval is the interval at which broadcast queue depth,
+	// retransmission, and expiration metrics are sampled, and at which
+	// BroadcastQueueWarnDepth is evaluated.
 	QueueCheckInterval time.Duration
 
 	// MsgpackUseNewTimeFormat when set to true, force the underlying msgpack
@@ -302,22 +335,26 @@ func ParseCIDRs(v []string) ([]net.IPNet, error) {
 func DefaultLANConfig() *Config {
 	hostname, _ := os.Hostname()
 	return &Config{
-		Name:                    hostname,
-		BindAddr:                "0.0.0.0",
-		BindPort:                7946,
-		AdvertiseAddr:           "",
-		AdvertisePort:           7946,
-		ProtocolVersion:         ProtocolVersion2Compatible,
-		TCPTimeout:              10 * time.Second,       // Timeout after 10 seconds
-		IndirectChecks:          3,                      // Use 3 nodes for the indirect ping
-		RetransmitMult:          4,                      // Retransmit a message 4 * log(N+1) nodes
-		SuspicionMult:           4,                      // Suspect a node for 4 * log(N+1) * Interval
-		SuspicionMaxTimeoutMult: 6,                      // For 10k nodes this will give a max timeout of 120 seconds
-		PushPullInterval:        30 * time.Second,       // Low frequency
-		ProbeTimeout:            500 * time.Millisecond, // Reasonable RTT time for LAN
-		ProbeInterval:           1 * time.Second,        // Failure check every second
-		DisableTcpPings:         false,                  // TCP pings are safe, even with mixed versions
-		AwarenessMaxMultiplier:  8,                      // Probe interval backs off to 8 seconds
+		Name:                          hostname,
+		BindAddr:                      "0.0.0.0",
+		BindPort:                      7946,
+		AdvertiseAddr:                 "",
+		AdvertisePort:                 7946,
+		ProtocolVersion:               ProtocolVersion2Compatible,
+		TCPTimeout:                    10 * time.Second, // Timeout after 10 seconds
+		IndirectChecks:                3,                // Use 3 nodes for the indirect ping
+		RetransmitMult:                4,                // Retransmit a message 4 * log(N+1) nodes
+		BroadcastRetransmitBackoff:    100 * time.Millisecond,
+		BroadcastMaxRetransmitBackoff: 2 * time.Second,
+		BroadcastMessageTTL:           30 * time.Second,
+		BroadcastQueueWarnDepth:       512,
+		SuspicionMult:                 4,                      // Suspect a node for 4 * log(N+1) * Interval
+		SuspicionMaxTimeoutMult:       6,                      // For 10k nodes this will give a max timeout of 120 seconds
+		PushPullInterval:              30 * time.Second,       // Low frequency
+		ProbeTimeout:                  500 * time.Millisecond, // Reasonable RTT time for LAN
+		ProbeInterval:                 1 * time.Second,        // Failure check every second
+		DisableTcpPings:               false,                  // TCP pings are safe, even with mixed versions
+		AwarenessMaxMultiplier:        8,                      // Probe interval backs off to 8 seconds
 
 		GossipNodes:          3,                      // Gossip to 3 nodes
 		GossipInterval:       200 * time.Millisecond, // Gossip more rapidly
@@ -353,6 +390,9 @@ func DefaultWANConfig() *Config {
 	conf.GossipNodes = 4 // Gossip less frequently, but to an additional node
 	conf.GossipInterval = 500 * time.Millisecond
 	conf.GossipToTheDeadTime = 60 * time.Second
+	conf.BroadcastRetransmitBackoff = 250 * time.Millisecond
+	conf.BroadcastMaxRetransmitBackoff = 5 * time.Second
+	conf.BroadcastMessageTTL = 60 * time.Second
 	return conf
 }
 
@@ -388,6 +428,9 @@ func DefaultLocalConfig() *Config {
 	conf.ProbeInterval = time.Second
 	conf.GossipInterval = 100 * time.Millisecond
 	conf.GossipToTheDeadTime = 15 * time.Second
+	conf.BroadcastRetransmitBackoff = 50 * time.Millisecond
+	conf.BroadcastMaxRetransmitBackoff = time.Second
+	conf.BroadcastMessageTTL = 15 * time.Second
 	return conf
 }
 

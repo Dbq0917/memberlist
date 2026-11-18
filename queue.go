@@ -4,11 +4,15 @@
 package memberlist
 
 import (
+	"container/heap"
 	"math"
 	"sync"
+	"time"
 
 	"github.com/google/btree"
 )
+
+const maxBackoffShift = 20
 
 // TransmitLimitedQueue is used to queue messages to broadcast to
 // the cluster (via gossip) but limits the number of transmits per
@@ -24,10 +28,38 @@ type TransmitLimitedQueue struct {
 	// number of retransmissions attempted.
 	RetransmitMult int
 
-	mu    sync.Mutex
-	tq    *btree.BTree // stores *limitedBroadcast as btree.Item
-	tm    map[string]*limitedBroadcast
-	idGen int64
+	// RetransmitBackoff is the base delay before a message is eligible for
+	// retransmission. The delay grows exponentially after RetransmitFanout
+	// attempts and is capped by MaxRetransmitBackoff. A zero value disables
+	// time-based backoff.
+	RetransmitBackoff time.Duration
+
+	// MaxRetransmitBackoff caps the exponential retransmission backoff. A zero
+	// value uses a cap of RetransmitBackoff * 16.
+	MaxRetransmitBackoff time.Duration
+
+	// RetransmitFanout is the number of immediate transmissions allowed before
+	// backoff starts. A zero value is treated as one.
+	RetransmitFanout int
+
+	// MessageTTL is the maximum amount of time a message may remain queued.
+	// Expired messages are dropped and Finished is called. A zero value
+	// disables expiration.
+	MessageTTL time.Duration
+
+	mu       sync.Mutex
+	tq       *btree.BTree // stores *limitedBroadcast as btree.Item
+	tm       map[string]*limitedBroadcast
+	idGen    int64
+	now      func() time.Time
+	expiries broadcastExpiryHeap
+
+	transmits    uint64
+	retransmits  uint64
+	expired      uint64
+	dropped      uint64
+	maxQueued    int
+	maxTransmits int
 }
 
 type limitedBroadcast struct {
@@ -36,7 +68,46 @@ type limitedBroadcast struct {
 	id        int64 // btree-key[2]: unique incrementing id stamped at submission time
 	b         Broadcast
 
-	name string // set if Broadcast is a NamedBroadcast
+	name         string // set if Broadcast is a NamedBroadcast
+	queuedAt     time.Time
+	expiresAt    time.Time
+	nextTransmit time.Time
+	heapIndex    int
+}
+
+// broadcastExpiryHeap orders broadcasts by expiration time. It lets the queue
+// discard stale messages without scanning the entire btree on every send.
+type broadcastExpiryHeap []*limitedBroadcast
+
+func (h broadcastExpiryHeap) Len() int { return len(h) }
+
+func (h broadcastExpiryHeap) Less(i, j int) bool {
+	if h[i].expiresAt.Equal(h[j].expiresAt) {
+		return h[i].id < h[j].id
+	}
+	return h[i].expiresAt.Before(h[j].expiresAt)
+}
+
+func (h broadcastExpiryHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+	h[i].heapIndex = i
+	h[j].heapIndex = j
+}
+
+func (h *broadcastExpiryHeap) Push(x any) {
+	cur := x.(*limitedBroadcast)
+	cur.heapIndex = len(*h)
+	*h = append(*h, cur)
+}
+
+func (h *broadcastExpiryHeap) Pop() any {
+	old := *h
+	n := len(old)
+	cur := old[n-1]
+	old[n-1] = nil
+	cur.heapIndex = -1
+	*h = old[:n-1]
+	return cur
 }
 
 // Less tests whether the current item is less than the given argument.
@@ -173,6 +244,7 @@ func (q *TransmitLimitedQueue) queueBroadcast(b Broadcast, initialTransmits int)
 	defer q.mu.Unlock()
 
 	q.lazyInit()
+	now := q.nowTime()
 
 	if q.idGen == math.MaxInt64 {
 		// it's super duper unlikely to wrap around within the retransmit limit
@@ -187,6 +259,11 @@ func (q *TransmitLimitedQueue) queueBroadcast(b Broadcast, initialTransmits int)
 		msgLen:    int64(len(b.Message())),
 		id:        id,
 		b:         b,
+		queuedAt:  now,
+		heapIndex: -1,
+	}
+	if q.MessageTTL > 0 {
+		lb.expiresAt = now.Add(q.MessageTTL)
 	}
 	unique := false
 	if nb, ok := b.(NamedBroadcast); ok {
@@ -233,8 +310,16 @@ func (q *TransmitLimitedQueue) queueBroadcast(b Broadcast, initialTransmits int)
 // deleteItem removes the given item from the overall datastructure. You
 // must already hold the mutex.
 func (q *TransmitLimitedQueue) deleteItem(cur *limitedBroadcast) {
+	q.removeFromExpiry(cur)
+	q.deleteItemNoHeap(cur)
+}
+
+// deleteItemNoHeap removes the given item from the btree and name map. It
+// assumes the caller has already removed the item from the expiry heap. You
+// must already hold the mutex.
+func (q *TransmitLimitedQueue) deleteItemNoHeap(cur *limitedBroadcast) {
 	_ = q.tq.Delete(cur)
-	if cur.name != "" {
+	if cur.name != "" && q.tm[cur.name] == cur {
 		delete(q.tm, cur.name)
 	}
 
@@ -245,6 +330,17 @@ func (q *TransmitLimitedQueue) deleteItem(cur *limitedBroadcast) {
 	}
 }
 
+// detachItem removes an item from the queue while it is being transmitted. It
+// deliberately does not reset the id generator: the item will be reinserted
+// after its transmit count is bumped.
+func (q *TransmitLimitedQueue) detachItem(cur *limitedBroadcast) {
+	q.removeFromExpiry(cur)
+	_ = q.tq.Delete(cur)
+	if cur.name != "" && q.tm[cur.name] == cur {
+		delete(q.tm, cur.name)
+	}
+}
+
 // addItem adds the given item into the overall datastructure. You must already
 // hold the mutex.
 func (q *TransmitLimitedQueue) addItem(cur *limitedBroadcast) {
@@ -252,6 +348,111 @@ func (q *TransmitLimitedQueue) addItem(cur *limitedBroadcast) {
 	if cur.name != "" {
 		q.tm[cur.name] = cur
 	}
+	if q.MessageTTL > 0 {
+		if cur.expiresAt.IsZero() {
+			cur.expiresAt = cur.queuedAt.Add(q.MessageTTL)
+		}
+		heap.Push(&q.expiries, cur)
+	}
+	if queued := q.tq.Len(); queued > q.maxQueued {
+		q.maxQueued = queued
+	}
+}
+
+func (q *TransmitLimitedQueue) removeFromExpiry(cur *limitedBroadcast) {
+	if cur.heapIndex >= 0 && cur.heapIndex < len(q.expiries) && q.expiries[cur.heapIndex] == cur {
+		heap.Remove(&q.expiries, cur.heapIndex)
+	}
+	cur.heapIndex = -1
+}
+
+func (q *TransmitLimitedQueue) nowTime() time.Time {
+	if q.now != nil {
+		return q.now()
+	}
+	return time.Now()
+}
+
+// expireLocked drops messages older than MessageTTL. You must already hold the
+// mutex.
+func (q *TransmitLimitedQueue) expireLocked(now time.Time) {
+	if q.MessageTTL <= 0 || len(q.expiries) == 0 {
+		return
+	}
+
+	for len(q.expiries) > 0 {
+		cur := q.expiries[0]
+		if cur.expiresAt.IsZero() || now.Before(cur.expiresAt) {
+			break
+		}
+
+		heap.Pop(&q.expiries)
+		q.deleteItemNoHeap(cur)
+		cur.b.Finished()
+		q.expired++
+	}
+}
+
+func (q *TransmitLimitedQueue) transmitLimit() int {
+	nodes := 0
+	if q.NumNodes != nil {
+		nodes = q.NumNodes()
+	}
+	limit := retransmitLimit(q.RetransmitMult, nodes)
+	if limit < 1 {
+		// Even with a zero retransmit multiplier a message is sent once.
+		return 1
+	}
+	return limit
+}
+
+// retransmitDelay returns the delay after the given number of transmissions.
+// The first RetransmitFanout attempts are immediate so that a message can be
+// handed to the configured gossip fanout before backoff starts.
+func (q *TransmitLimitedQueue) retransmitDelay(transmits int) time.Duration {
+	if q.RetransmitBackoff <= 0 || transmits <= 0 {
+		return 0
+	}
+
+	fanout := q.RetransmitFanout
+	if fanout < 1 {
+		fanout = 1
+	}
+	if transmits < fanout {
+		return 0
+	}
+
+	maxDelay := q.MaxRetransmitBackoff
+	if maxDelay <= 0 {
+		maxDelay = q.RetransmitBackoff
+		for range 4 {
+			if maxDelay > math.MaxInt64/2 {
+				maxDelay = math.MaxInt64
+				break
+			}
+			maxDelay *= 2
+		}
+	}
+	if maxDelay < q.RetransmitBackoff {
+		maxDelay = q.RetransmitBackoff
+	}
+
+	shift := transmits - fanout
+	if shift > maxBackoffShift {
+		shift = maxBackoffShift
+	}
+
+	delay := q.RetransmitBackoff
+	for range shift {
+		if delay >= maxDelay/2 {
+			return maxDelay
+		}
+		delay *= 2
+	}
+	if delay > maxDelay {
+		return maxDelay
+	}
+	return delay
 }
 
 // getTransmitRange returns a pair of min/max values for transmit values
@@ -278,12 +479,15 @@ func (q *TransmitLimitedQueue) GetBroadcasts(overhead, limit int) [][]byte {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
+	now := q.nowTime()
+	q.expireLocked(now)
+
 	// Fast path the default case
 	if q.lenLocked() == 0 {
 		return nil
 	}
 
-	transmitLimit := retransmitLimit(q.RetransmitMult, q.NumNodes())
+	transmitLimit := q.transmitLimit()
 
 	var (
 		bytesUsed int
@@ -324,6 +528,11 @@ func (q *TransmitLimitedQueue) GetBroadcasts(overhead, limit int) [][]byte {
 				// probably sane to just skip it and move on for now.
 				return true
 			}
+			if cur.nextTransmit.After(now) {
+				// Still backing off. Keep looking for another message that
+				// fits and is eligible to be sent.
+				return true
+			}
 			keep = cur
 			return false
 		})
@@ -339,8 +548,16 @@ func (q *TransmitLimitedQueue) GetBroadcasts(overhead, limit int) [][]byte {
 		bytesUsed += overhead + len(msg)
 		toSend = append(toSend, msg)
 
+		q.transmits++
+		if keep.transmits > 0 {
+			q.retransmits++
+		}
+		if keep.transmits+1 > q.maxTransmits {
+			q.maxTransmits = keep.transmits + 1
+		}
+
 		// Check if we should stop transmission
-		q.deleteItem(keep)
+		q.detachItem(keep)
 		if keep.transmits+1 >= transmitLimit {
 			keep.b.Finished()
 		} else {
@@ -350,12 +567,21 @@ func (q *TransmitLimitedQueue) GetBroadcasts(overhead, limit int) [][]byte {
 			// finished our search. Otherwise we'll possibly re-add the message
 			// when we ascend to the next tier.
 			keep.transmits++
+			if delay := q.retransmitDelay(keep.transmits); delay > 0 {
+				keep.nextTransmit = now.Add(delay)
+			}
 			reinsert = append(reinsert, keep)
 		}
 	}
 
 	for _, cur := range reinsert {
 		q.addItem(cur)
+	}
+	if q.tq.Len() == 0 {
+		// All messages finished, but only reset once no reinsertion is
+		// pending. Resetting while an item is in flight can reuse an ID for the
+		// reinserted item and corrupt the queue.
+		q.idGen = 0
 	}
 
 	return toSend
@@ -365,7 +591,59 @@ func (q *TransmitLimitedQueue) GetBroadcasts(overhead, limit int) [][]byte {
 func (q *TransmitLimitedQueue) NumQueued() int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	q.expireLocked(q.nowTime())
 	return q.lenLocked()
+}
+
+// TransmitLimitedQueueStats is a snapshot of a TransmitLimitedQueue. Counters
+// are cumulative since the queue was created or last reset.
+type TransmitLimitedQueueStats struct {
+	// NumQueued is the current number of queued messages.
+	NumQueued int
+
+	// MaxQueued is the high-water mark for NumQueued.
+	MaxQueued int
+
+	// Transmits is the total number of attempted message transmissions.
+	Transmits uint64
+
+	// Retransmits is the number of attempted transmissions after the first
+	// attempt for a message.
+	Retransmits uint64
+
+	// Expired is the number of messages dropped because they exceeded
+	// MessageTTL.
+	Expired uint64
+
+	// Dropped is the number of messages dropped by Prune.
+	Dropped uint64
+
+	// MaxTransmits is the largest number of attempts made for any one message.
+	MaxTransmits int
+
+	// RetransmitLimit is the current per-message transmit limit derived from
+	// RetransmitMult and NumNodes.
+	RetransmitLimit int
+}
+
+// Stats returns a snapshot of the queue's depth and transmission counters.
+// Calling Stats also expires stale messages.
+func (q *TransmitLimitedQueue) Stats() TransmitLimitedQueueStats {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	q.expireLocked(q.nowTime())
+
+	return TransmitLimitedQueueStats{
+		NumQueued:       q.lenLocked(),
+		MaxQueued:       q.maxQueued,
+		Transmits:       q.transmits,
+		Retransmits:     q.retransmits,
+		Expired:         q.expired,
+		Dropped:         q.dropped,
+		MaxTransmits:    q.maxTransmits,
+		RetransmitLimit: q.transmitLimit(),
+	}
 }
 
 // lenLocked returns the length of the overall queue datastructure. You must
@@ -390,6 +668,13 @@ func (q *TransmitLimitedQueue) Reset() {
 	q.tq = nil
 	q.tm = nil
 	q.idGen = 0
+	q.expiries = nil
+	q.transmits = 0
+	q.retransmits = 0
+	q.expired = 0
+	q.dropped = 0
+	q.maxQueued = 0
+	q.maxTransmits = 0
 }
 
 // Prune will retain the maxRetain latest messages, and the rest
@@ -398,8 +683,10 @@ func (q *TransmitLimitedQueue) Prune(maxRetain int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
+	q.expireLocked(q.nowTime())
+
 	// Do nothing if queue size is less than the limit
-	for q.tq.Len() > maxRetain {
+	for q.lenLocked() > maxRetain {
 		item := q.tq.Max()
 		if item == nil {
 			break
@@ -407,5 +694,6 @@ func (q *TransmitLimitedQueue) Prune(maxRetain int) {
 		cur := item.(*limitedBroadcast)
 		cur.b.Finished()
 		q.deleteItem(cur)
+		q.dropped++
 	}
 }

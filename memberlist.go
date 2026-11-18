@@ -218,9 +218,21 @@ func newMemberlist(conf *Config) (*Memberlist, error) {
 		nodeTimers:           make(map[string]*suspicion),
 		awareness:            newAwareness(conf.AwarenessMaxMultiplier, conf.MetricLabels),
 		ackHandlers:          make(map[uint32]*ackHandler),
-		broadcasts:           &TransmitLimitedQueue{RetransmitMult: conf.RetransmitMult},
-		logger:               logger,
-		metricLabels:         conf.MetricLabels,
+		broadcasts: &TransmitLimitedQueue{
+			RetransmitMult:       conf.RetransmitMult,
+			RetransmitBackoff:    conf.BroadcastRetransmitBackoff,
+			MaxRetransmitBackoff: conf.BroadcastMaxRetransmitBackoff,
+			RetransmitFanout:     conf.BroadcastRetransmitFanout,
+			MessageTTL:           conf.BroadcastMessageTTL,
+		},
+		logger:       logger,
+		metricLabels: conf.MetricLabels,
+	}
+	if m.broadcasts.RetransmitFanout <= 0 {
+		m.broadcasts.RetransmitFanout = conf.GossipNodes
+		if m.broadcasts.RetransmitFanout <= 0 {
+			m.broadcasts.RetransmitFanout = 1
+		}
 	}
 	m.broadcasts.NumNodes = func() int {
 		return m.estNumNodes()
@@ -636,6 +648,12 @@ func (m *Memberlist) NumMembers() (alive int) {
 	return
 }
 
+// BroadcastQueueStats returns a snapshot of the broadcast retransmission
+// queue. It is useful for monitoring queue depth and retransmission pressure.
+func (m *Memberlist) BroadcastQueueStats() TransmitLimitedQueueStats {
+	return m.broadcasts.Stats()
+}
+
 // Leave will broadcast a leave message but will not shutdown the background
 // listeners, meaning the node will continue participating in gossip and state
 // updates.
@@ -787,13 +805,43 @@ func (m *Memberlist) changeNode(addr string, f func(*nodeState)) {
 // checkBroadcastQueueDepth periodically checks the size of the broadcast queue
 // to see if it is too large
 func (m *Memberlist) checkBroadcastQueueDepth() {
+	interval := m.config.QueueCheckInterval
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	var previous TransmitLimitedQueueStats
 	for {
 		select {
-		case <-time.After(m.config.QueueCheckInterval):
-			numq := m.broadcasts.NumQueued()
-			metrics.AddSampleWithLabels([]string{"memberlist", "queue", "broadcasts"}, float32(numq), m.metricLabels)
+		case <-ticker.C:
+			stats := m.broadcasts.Stats()
+
+			metrics.AddSampleWithLabels([]string{"memberlist", "queue", "broadcasts"}, float32(stats.NumQueued), m.metricLabels)
+			metrics.SetGaugeWithLabels([]string{"memberlist", "queue", "broadcasts", "depth"}, float32(stats.NumQueued), m.metricLabels)
+			metrics.SetGaugeWithLabels([]string{"memberlist", "queue", "broadcasts", "max"}, float32(stats.MaxQueued), m.metricLabels)
+			metrics.SetGaugeWithLabels([]string{"memberlist", "queue", "broadcasts", "retransmit_limit"}, float32(stats.RetransmitLimit), m.metricLabels)
+			metrics.IncrCounterWithLabels([]string{"memberlist", "broadcast", "transmits"}, counterDelta(stats.Transmits, previous.Transmits), m.metricLabels)
+			metrics.IncrCounterWithLabels([]string{"memberlist", "broadcast", "retransmits"}, counterDelta(stats.Retransmits, previous.Retransmits), m.metricLabels)
+			metrics.IncrCounterWithLabels([]string{"memberlist", "broadcast", "expired"}, counterDelta(stats.Expired, previous.Expired), m.metricLabels)
+			metrics.IncrCounterWithLabels([]string{"memberlist", "broadcast", "dropped"}, counterDelta(stats.Dropped, previous.Dropped), m.metricLabels)
+
+			if warnDepth := m.config.BroadcastQueueWarnDepth; warnDepth > 0 && stats.NumQueued >= warnDepth {
+				m.logger.Printf("[WARN] memberlist: broadcast queue depth is %d (threshold %d, retransmit limit %d); sustained high depth can indicate packet loss or excessive churn",
+					stats.NumQueued, warnDepth, stats.RetransmitLimit)
+			}
+
+			previous = stats
 		case <-m.shutdownCh:
 			return
 		}
 	}
+}
+
+func counterDelta(current, previous uint64) float32 {
+	if current < previous {
+		return float32(current)
+	}
+	return float32(current - previous)
 }

@@ -268,6 +268,9 @@ func TestCreate_checkBroadcastQueueMetrics(t *testing.T) {
 
 	sampleName := "consul.usage.test.memberlist.queue.broadcasts"
 	verifySampleExists(t, sampleName, sink)
+	verifyGaugeExists(t, "consul.usage.test.memberlist.queue.broadcasts.depth", sink)
+	verifyGaugeExists(t, "consul.usage.test.memberlist.queue.broadcasts.max", sink)
+	verifyGaugeExists(t, "consul.usage.test.memberlist.queue.broadcasts.retransmit_limit", sink)
 }
 
 func TestCreate_keyringOnly(t *testing.T) {

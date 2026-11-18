@@ -74,3 +74,7 @@ to the protocol on our issue tracker.
 ## Metrics Emission
 
 This library emits metrics using `github.com/hashicorp/go-metrics`.
+
+Broadcast queue depth, retransmission, and expiration metrics, along with the
+packet-loss tuning controls, are documented in
+[`BROADCAST_RELIABILITY.md`](BROADCAST_RELIABILITY.md).
