@@ -43,6 +43,7 @@ type Memberlist struct {
 	incarnation atomic.Uint32 // Local incarnation number
 	numNodes    atomic.Uint32 // Number of known nodes (estimate)
 	pushPullReq atomic.Uint32 // Number of push/pull requests
+	maxMembers  atomic.Int32  // Membership limit, zero means unlimited
 
 	advertiseLock sync.RWMutex
 	advertiseAddr net.IP
@@ -69,6 +70,9 @@ type Memberlist struct {
 	nodeMap    map[string]*nodeState // Maps Node.Name -> NodeState
 	nodeTimers map[string]*suspicion // Maps Node.Name -> suspicion timer
 	awareness  *awareness
+
+	joinEventsLock sync.Mutex
+	joinEvents     []JoinEvent // Recent join admission decisions, oldest first
 
 	tickerLock sync.Mutex
 	tickers    []*time.Ticker
@@ -225,6 +229,7 @@ func newMemberlist(conf *Config) (*Memberlist, error) {
 	m.broadcasts.NumNodes = func() int {
 		return m.estNumNodes()
 	}
+	m.maxMembers.Store(int32(conf.MaxMembers))
 
 	// Get the final advertise address from the transport, which may need
 	// to see which address we bound to. We'll refresh this each time we

@@ -322,6 +322,39 @@ func (m *Memberlist) handleConn(conn net.Conn) {
 			return
 		}
 
+		var joinNode string
+		if join {
+			joinNode = m.joiningNodeName(remoteNodes)
+
+			// Refuse joins that would exceed the membership limit before
+			// any state is exchanged, so the rejection cannot disturb
+			// existing members. The joining node gets an explicit error
+			// rather than a timeout.
+			if err := m.checkJoinCapacity(remoteNodes); err != nil {
+				m.logger.Printf("[WARN] memberlist: %s %s", err, LogConn(conn))
+				m.recordJoinEvent(JoinEvent{
+					Time:       time.Now(),
+					RemoteAddr: conn.RemoteAddr().String(),
+					Node:       joinNode,
+					Admitted:   false,
+					Reason:     err.Error(),
+					NumMembers: m.NumMembers(),
+					MaxMembers: m.MaxMembers(),
+				})
+
+				resp := errResp{err.Error()}
+				out, encErr := encode(errMsg, &resp, m.config.MsgpackUseNewTimeFormat)
+				if encErr != nil {
+					m.logger.Printf("[ERR] memberlist: Failed to encode error response: %s", encErr)
+					return
+				}
+				if sendErr := m.rawSendMsgStream(conn, out.Bytes(), streamLabel); sendErr != nil {
+					m.logger.Printf("[ERR] memberlist: Failed to send error: %s %s", sendErr, LogConn(conn))
+				}
+				return
+			}
+		}
+
 		if err := m.sendLocalState(conn, join, streamLabel); err != nil {
 			m.logger.Printf("[ERR] memberlist: Failed to push local state: %s %s", err, LogConn(conn))
 			return
@@ -330,6 +363,22 @@ func (m *Memberlist) handleConn(conn net.Conn) {
 		if err := m.mergeRemoteState(join, remoteNodes, userState); err != nil {
 			m.logger.Printf("[ERR] memberlist: Failed push/pull merge: %s %s", err, LogConn(conn))
 			return
+		}
+
+		if join {
+			numMembers := m.NumMembers()
+			limit := m.MaxMembers()
+			m.recordJoinEvent(JoinEvent{
+				Time:       time.Now(),
+				RemoteAddr: conn.RemoteAddr().String(),
+				Node:       joinNode,
+				Admitted:   true,
+				NumMembers: numMembers,
+				MaxMembers: limit,
+			})
+			if limit > 0 && numMembers*10 >= limit*9 {
+				m.logger.Printf("[WARN] memberlist: membership approaching limit: members %d/%d", numMembers, limit)
+			}
 		}
 	case pingMsg:
 		var p ping

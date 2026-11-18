@@ -78,6 +78,16 @@ type Config struct {
 	// at the expense of increased bandwidth.
 	RetransmitMult int
 
+	// MaxMembers is the maximum number of live members the cluster will
+	// admit through Join. Once the limit is reached, further join attempts
+	// are rejected with an explicit ErrClusterAtCapacity error instead of
+	// timing out, and the rejection is recorded in the join event log (see
+	// JoinEvents). Rejoins by nodes that are already live members do not
+	// count against the limit. Zero (the default) means no limit, which
+	// preserves the historical behavior. The limit can be adjusted at
+	// runtime with SetMaxMembers.
+	MaxMembers int
+
 	// SuspicionMult is the multiplier for determining the time an
 	// inaccessible node is considered suspect before declaring it dead.
 	// The actual timeout is calculated using the formula:
