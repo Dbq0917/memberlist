@@ -1160,3 +1160,112 @@ func (c *errorReadNetConn) Close() error {
 	close(c.closed)
 	return nil
 }
+
+// legacyAlive mirrors the alive wire structure before the Ready field was
+// appended. It is used to prove that an upgraded node can still decode
+// messages produced by an older peer and vice versa.
+type legacyAlive struct {
+	Incarnation uint32
+	Node        string
+	Addr        []byte
+	Port        uint16
+	Meta        []byte
+	Vsn         []uint8
+}
+
+// legacyPushNodeState mirrors pushNodeState before the Ready field was added.
+type legacyPushNodeState struct {
+	Name        string
+	Addr        []byte
+	Port        uint16
+	Meta        []byte
+	Incarnation uint32
+	State       NodeStateType
+	Vsn         []uint8
+}
+
+// TestAlive_ReadinessWireCompat verifies that the appended Ready flag survives
+// a msgpack round trip and does not break interoperability with peers that
+// predate the field. Default (map) encoding means an absent field simply
+// decodes to its zero value instead of causing a decode error.
+func TestAlive_ReadinessWireCompat(t *testing.T) {
+	want := alive{
+		Incarnation: 7,
+		Node:        "node-a",
+		Addr:        []byte{127, 0, 0, 1},
+		Port:        7946,
+		Meta:        []byte("meta"),
+		Vsn:         []uint8{1, 5, 2, 0, 0, 0},
+		Ready:       true,
+	}
+
+	buf, err := encode(aliveMsg, &want, true)
+	require.NoError(t, err)
+
+	// A current peer decodes every field, including Ready.
+	var got alive
+	require.NoError(t, decode(buf.Bytes()[1:], &got))
+	require.True(t, got.Ready)
+	require.Equal(t, want.Node, got.Node)
+	require.Equal(t, want.Incarnation, got.Incarnation)
+
+	// An older peer (no Ready field) still decodes the common fields.
+	var old legacyAlive
+	require.NoError(t, decode(buf.Bytes()[1:], &old))
+	require.Equal(t, want.Node, old.Node)
+	require.Equal(t, want.Incarnation, old.Incarnation)
+
+	// A message from an older peer decodes with Ready defaulting to false, so
+	// the node is kept in the member list but never treated as serviceable.
+	oldBuf, err := encode(aliveMsg, &legacyAlive{
+		Incarnation: 3,
+		Node:        "node-b",
+		Addr:        []byte{127, 0, 0, 2},
+		Port:        7946,
+		Vsn:         []uint8{1, 5, 2, 0, 0, 0},
+	}, true)
+	require.NoError(t, err)
+
+	var fromOld alive
+	require.NoError(t, decode(oldBuf.Bytes()[1:], &fromOld))
+	require.False(t, fromOld.Ready)
+	require.Equal(t, "node-b", fromOld.Node)
+}
+
+// TestPushNodeState_ReadinessWireCompat exercises the same compatibility for
+// the push/pull state exchange.
+func TestPushNodeState_ReadinessWireCompat(t *testing.T) {
+	want := pushNodeState{
+		Name:        "node-a",
+		Addr:        []byte{127, 0, 0, 1},
+		Port:        7946,
+		Incarnation: 9,
+		State:       StateAlive,
+		Vsn:         []uint8{1, 5, 2, 0, 0, 0},
+		Ready:       true,
+	}
+
+	var buf bytes.Buffer
+	hd := codec.MsgpackHandle{}
+	require.NoError(t, codec.NewEncoder(&buf, &hd).Encode(&want))
+
+	var got pushNodeState
+	require.NoError(t, codec.NewDecoder(&buf, &hd).Decode(&got))
+	require.True(t, got.Ready)
+
+	// An older push/pull snapshot without Ready decodes as not ready.
+	var oldBuf bytes.Buffer
+	require.NoError(t, codec.NewEncoder(&oldBuf, &hd).Encode(&legacyPushNodeState{
+		Name:        "node-b",
+		Addr:        []byte{127, 0, 0, 2},
+		Port:        7946,
+		Incarnation: 1,
+		State:       StateAlive,
+		Vsn:         []uint8{1, 5, 2, 0, 0, 0},
+	}))
+
+	var fromOld pushNodeState
+	require.NoError(t, codec.NewDecoder(&oldBuf, &hd).Decode(&fromOld))
+	require.False(t, fromOld.Ready)
+	require.Equal(t, "node-b", fromOld.Name)
+}

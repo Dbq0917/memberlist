@@ -47,12 +47,17 @@ type Node struct {
 	Port  uint16
 	Meta  []byte        // Metadata from the delegate for this node.
 	State NodeStateType // State of the node.
-	PMin  uint8         // Minimum protocol version this understands
-	PMax  uint8         // Maximum protocol version this understands
-	PCur  uint8         // Current version node is speaking
-	DMin  uint8         // Min protocol version for the delegate to understand
-	DMax  uint8         // Max protocol version for the delegate to understand
-	DCur  uint8         // Current version delegate is speaking
+	// Ready reports whether the node has finished its initial state
+	// synchronization and may receive application traffic. A node can be
+	// present in the member list (see Memberlist.Members) while it is not yet
+	// ready; such a node must not be selected as a target for requests.
+	Ready bool
+	PMin  uint8 // Minimum protocol version this understands
+	PMax  uint8 // Maximum protocol version this understands
+	PCur  uint8 // Current version node is speaking
+	DMin  uint8 // Min protocol version for the delegate to understand
+	DMax  uint8 // Max protocol version for the delegate to understand
+	DCur  uint8 // Current version delegate is speaking
 }
 
 // Address returns the host:port form of a node's address, suitable for use
@@ -81,6 +86,22 @@ type nodeState struct {
 	Incarnation uint32        // Last known incarnation number
 	State       NodeStateType // Current state
 	StateChange time.Time     // Time last state change happened
+}
+
+// serviceableSnapshot is a precomputed view of the nodes that may currently
+// receive application traffic. It is rebuilt only when membership state
+// changes instead of re-evaluating every node on each request. A node is
+// serviceable when it is neither dead nor left and has reported readiness.
+type serviceableSnapshot struct {
+	nodes   []*Node
+	nodeMap map[string]*Node
+}
+
+// serviceable returns whether the node may receive application traffic. Being
+// present in the member list is not sufficient: a node that has not finished
+// its state synchronization (Ready == false) must not be sent requests.
+func (n *nodeState) serviceable() bool {
+	return !n.DeadOrLeft() && n.Ready
 }
 
 // Address returns the host:port form of a node's address, suitable for use
@@ -583,6 +604,9 @@ func (m *Memberlist) resetNodes() {
 
 	// Shuffle live nodes
 	shuffleNodes(m.nodes)
+
+	// Recompute the serviceable view after trimming dead members.
+	m.refreshServiceableLocked()
 }
 
 // gossip is invoked every GossipInterval period to broadcast our gossip
@@ -927,6 +951,9 @@ func (m *Memberlist) refute(me *nodeState, accusedInc uint32) {
 		Addr:        me.Addr,
 		Port:        me.Port,
 		Meta:        me.Meta,
+		// Preserve our serviceability so refuting a suspect/dead accusation
+		// does not gossip a stale not-ready state.
+		Ready: m.localReady.Load(),
 		Vsn: []uint8{
 			me.PMin, me.PMax, me.PCur,
 			me.DMin, me.DMax, me.DCur,
@@ -1085,6 +1112,17 @@ func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
 	// Store the old state and meta data
 	oldState := state.State
 	oldMeta := state.Meta
+	oldReady := state.Ready
+
+	// Readiness is authoritative for the local node: it is driven by
+	// SetReady and tracked in localReady, so a received alive message must not
+	// be able to override it. For remote nodes we trust the readiness flag
+	// carried by their alive message. Messages from older peers that do not
+	// carry the flag leave readiness unchanged.
+	effectiveReady := a.Ready
+	if isLocalNode {
+		effectiveReady = m.localReady.Load()
+	}
 
 	// If this is us we need to refute, otherwise re-broadcast
 	if !bootstrap && isLocalNode {
@@ -1107,7 +1145,8 @@ func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
 		//
 		if a.Incarnation == state.Incarnation &&
 			bytes.Equal(a.Meta, state.Meta) &&
-			bytes.Equal(a.Vsn, versions) {
+			bytes.Equal(a.Vsn, versions) &&
+			oldReady == effectiveReady {
 			return
 		}
 		m.refute(state, a.Incarnation)
@@ -1130,10 +1169,17 @@ func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
 		state.Meta = a.Meta
 		state.Addr = a.Addr
 		state.Port = a.Port
+		state.Ready = effectiveReady
 		if state.State != StateAlive {
 			state.State = StateAlive
 			state.StateChange = time.Now()
 		}
+	}
+
+	// Refresh the cached serviceable view whenever readiness or membership
+	// state may have changed.
+	if oldReady != state.Ready || oldState != state.State {
+		m.refreshServiceableLocked()
 	}
 
 	// Update metrics
@@ -1243,6 +1289,9 @@ func (m *Memberlist) suspectNode(s *suspect) {
 		}
 	}
 	m.nodeTimers[s.Node] = newSuspicion(s.From, k, min, max, fn)
+
+	// The node left the alive state, so it can no longer receive traffic.
+	m.refreshServiceableLocked()
 }
 
 // deadNode is invoked by the network layer when we get a message
@@ -1304,6 +1353,9 @@ func (m *Memberlist) deadNode(d *dead) {
 	if m.config.Events != nil {
 		m.config.Events.NotifyLeave(&state.Node)
 	}
+
+	// The node is no longer eligible to receive traffic.
+	m.refreshServiceableLocked()
 }
 
 // mergeState is invoked by the network layer when we get a Push/Pull
@@ -1319,6 +1371,7 @@ func (m *Memberlist) mergeState(remote []pushNodeState) {
 				Port:        r.Port,
 				Meta:        r.Meta,
 				Vsn:         r.Vsn,
+				Ready:       r.Ready,
 			}
 			m.aliveNode(&a, nil, false)
 

@@ -40,6 +40,75 @@ func HostMemberlist(host string, t *testing.T, f func(*Config)) *Memberlist {
 	return m
 }
 
+// TestServiceableSnapshot asserts the cached serviceability view against the
+// raw member list across ready, not-ready, dead, and rejoining node states.
+// The cache is the structure request routing reads, so it must never include a
+// node that is missing readiness or has left the alive set.
+func TestServiceableSnapshot(t *testing.T) {
+	addr1 := getBindAddr()
+	addr2 := getBindAddr()
+
+	m := HostMemberlist(addr1.String(), t, nil)
+	t.Cleanup(func() { require.NoError(t, m.Shutdown()) })
+
+	mkAlive := func(addr net.IP, incarnation uint32, ready bool) *alive {
+		return &alive{
+			Node:        addr.String(),
+			Addr:        []byte(addr),
+			Port:        1234,
+			Incarnation: incarnation,
+			Vsn:         m.config.BuildVsnArray(),
+			Ready:       ready,
+		}
+	}
+
+	// Two nodes join the member list. The local node's readiness is owned by
+	// SetReady; the remote node stays not-ready while its sync is running.
+	m.aliveNode(mkAlive(addr1, 1, false), nil, true)
+	require.NoError(t, m.SetReady(true))
+	m.aliveNode(mkAlive(addr2, 1, false), nil, false)
+
+	require.Len(t, m.Members(), 2, "both nodes are in the member list")
+	require.Equal(t, 1, m.NumServiceMembers(), "only the ready node serves traffic")
+	require.True(t, m.IsServiceable(addr1.String()))
+	require.False(t, m.IsServiceable(addr2.String()))
+
+	// Repeated reads return the same cached judgment; the snapshot pointer only
+	// changes when membership/readiness state changes.
+	snap := m.serviceable.Load()
+	for range 10 {
+		require.Equal(t, 1, m.NumServiceMembers())
+		require.Same(t, snap, m.serviceable.Load())
+	}
+
+	// The second node finishes its synchronization and becomes serviceable.
+	m.aliveNode(mkAlive(addr2, 2, true), nil, false)
+	require.Equal(t, 2, m.NumServiceMembers())
+	require.True(t, m.IsServiceable(addr2.String()))
+
+	// Marking the second node dead removes it from the serviceable set while it
+	// remains tracked internally until the dead-node reaper runs.
+	m.deadNode(&dead{Incarnation: 3, Node: addr2.String(), From: "other"})
+	require.False(t, m.IsServiceable(addr2.String()))
+	require.Equal(t, 1, m.NumServiceMembers())
+
+	// A later alive message with a newer incarnation re-admits the node once it
+	// reports readiness again.
+	m.aliveNode(mkAlive(addr2, 4, true), nil, false)
+	require.True(t, m.IsServiceable(addr2.String()))
+	require.Equal(t, 2, m.NumServiceMembers())
+
+	// Unknown nodes are never serviceable.
+	require.False(t, m.IsServiceable("never-heard-of"))
+
+	// ServiceMembers returns a defensive copy: mutating it cannot corrupt the
+	// cached snapshot.
+	served := m.ServiceMembers()
+	require.Len(t, served, 2)
+	served[0] = nil
+	require.NotNil(t, m.ServiceMembers()[0])
+}
+
 func TestMemberList_Probe(t *testing.T) {
 	addr1 := getBindAddr()
 	addr2 := getBindAddr()

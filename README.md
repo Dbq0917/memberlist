@@ -52,6 +52,36 @@ for _, member := range list.Members() {
 // events when members join or leave.
 ```
 
+### Routing traffic only to ready nodes
+
+Membership and readiness are separate conditions. A newly joined node is
+gossiped into `Members()` as soon as it contacts the cluster, but its initial
+application-state synchronization can still be running. Forwarding requests to
+it during that window fails against its empty local state.
+
+A node starts not-ready and advertises readiness explicitly once its
+synchronization completes:
+
+```go
+// Called after the node's local state has caught up with the cluster.
+if err := list.SetReady(true); err != nil {
+	panic("Failed to advertise readiness: " + err.Error())
+}
+```
+
+Route requests using the serviceable view instead of the raw member list.
+Readiness is maintained as a cached snapshot, so these calls are cheap enough
+for the per-request path and do not re-evaluate every member on each call:
+
+```go
+for _, member := range list.ServiceMembers() {
+	// Every member here is alive and ready to serve traffic.
+}
+if !list.IsServiceable(target) {
+	// Pick a different target; this node is unknown, down, or still syncing.
+}
+```
+
 The most difficult part of memberlist is configuring it since it has many
 available knobs in order to tune state propagation delay and convergence times.
 Memberlist provides a default configuration that offers a good starting point,

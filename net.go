@@ -163,6 +163,12 @@ type alive struct {
 	// The versions of the protocol/delegate that are being spoken, order:
 	// pmin, pmax, pcur, dmin, dmax, dcur
 	Vsn []uint8
+
+	// Ready reports whether the originating node has completed its initial
+	// state synchronization and may receive application traffic. A node can be
+	// alive and present in the member list while this is still false.
+	// Appended after Vsn so older peers that decode fewer fields ignore it.
+	Ready bool
 }
 
 // dead is broadcast when we confirm a node is dead
@@ -196,6 +202,7 @@ type pushNodeState struct {
 	Incarnation uint32
 	State       NodeStateType
 	Vsn         []uint8 // Protocol versions
+	Ready       bool    // Whether the node may receive application traffic
 }
 
 // compress is used to wrap an underlying payload
@@ -1027,6 +1034,7 @@ func (m *Memberlist) sendLocalState(conn net.Conn, join bool, streamLabel string
 		localNodes[idx].Incarnation = n.Incarnation
 		localNodes[idx].State = n.State
 		localNodes[idx].Meta = n.Meta
+		localNodes[idx].Ready = n.Ready
 		localNodes[idx].Vsn = []uint8{
 			n.PMin, n.PMax, n.PCur,
 			n.DMin, n.DMax, n.DCur,

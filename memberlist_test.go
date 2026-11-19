@@ -671,6 +671,143 @@ func TestMemberList_Members(t *testing.T) {
 	}
 }
 
+// TestMemberlist_Join_Readiness verifies that joining the member list and
+// being allowed to receive application traffic are separate conditions. A new
+// node can take tens of seconds to finish its initial state synchronization;
+// during that window it must be present in Members() on every peer but absent
+// from the serviceable set, otherwise requests forwarded to it fail with
+// "not found". Readiness is served from a cached snapshot and must converge
+// cluster-wide once the node marks itself ready.
+func TestMemberlist_Join_Readiness(t *testing.T) {
+	// Fast gossip so the test does not have to wait on the production-scale
+	// (tens of seconds) synchronization timers. The long synchronization is
+	// modeled by leaving the joining node not-ready rather than by real time.
+	fastTimers := func(c *Config) {
+		c.ProbeInterval = 20 * time.Millisecond
+		c.ProbeTimeout = 100 * time.Millisecond
+		c.GossipInterval = 20 * time.Millisecond
+		c.PushPullInterval = 200 * time.Millisecond
+	}
+
+	// Build the initial two-node cluster. Both are fully synchronized and
+	// therefore marked ready to serve traffic.
+	c1 := testConfig(t)
+	fastTimers(c1)
+	m1, err := Create(c1)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, m1.Shutdown()) }()
+	require.NoError(t, m1.SetReady(true))
+
+	c2 := testConfig(t)
+	fastTimers(c2)
+	c2.BindPort = m1.config.BindPort
+	m2, err := Create(c2)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, m2.Shutdown()) }()
+
+	num, err := m2.Join([]string{m1.config.Name + "/" + m1.config.BindAddr})
+	require.NoError(t, err)
+	require.Equal(t, 1, num)
+
+	waitUntilSizeAndEstimate(t, m1, 2)
+	waitUntilSizeAndEstimate(t, m2, 2)
+	require.NoError(t, m2.SetReady(true))
+
+	// Both existing nodes must be serviceable on every peer.
+	iretry.Run(t, func(r *iretry.R) {
+		for _, m := range []*Memberlist{m1, m2} {
+			if got := m.NumServiceMembers(); got != 2 {
+				r.Fatalf("%s expected 2 serviceable members, got %d", m.config.Name, got)
+			}
+		}
+	})
+
+	// Add a third node. Its application state synchronization takes tens of
+	// seconds in production, so it deliberately stays not-ready after joining.
+	c3 := testConfig(t)
+	fastTimers(c3)
+	c3.BindPort = m1.config.BindPort
+	m3, err := Create(c3)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, m3.Shutdown()) }()
+
+	num, err = m3.Join([]string{m1.config.Name + "/" + m1.config.BindAddr})
+	require.NoError(t, err)
+	require.Equal(t, 1, num)
+
+	// Membership converges first. The not-ready node appears in Members() on
+	// the existing peers even though its state synchronization is incomplete.
+	waitUntilSizeAndEstimate(t, m1, 3)
+	waitUntilSizeAndEstimate(t, m2, 3)
+	waitUntilSizeAndEstimate(t, m3, 3)
+
+	// The joining node knows it is not ready itself.
+	require.False(t, m3.IsReady())
+
+	// While synchronization is in flight, no peer may route traffic to m3.
+	// Repeated reads exercise the cached judgment rather than recomputing it.
+	iretry.Run(t, func(r *iretry.R) {
+		for _, m := range []*Memberlist{m1, m2, m3} {
+			if m.IsServiceable(m3.config.Name) {
+				r.Fatalf("%s routed traffic to not-ready node %s",
+					m.config.Name, m3.config.Name)
+			}
+			if got := m.NumServiceMembers(); got != 2 {
+				r.Fatalf("%s expected 2 serviceable members during sync, got %d",
+					m.config.Name, got)
+			}
+			if len(m.ServiceMembers()) != 2 {
+				r.Fatalf("%s ServiceMembers() returned %d nodes during sync",
+					m.config.Name, len(m.ServiceMembers()))
+			}
+		}
+	})
+
+	// The not-ready node is still observable through the plain member list;
+	// membership and serviceability are genuinely separate judgments.
+	require.Contains(t, memberNames(m1.Members()), m3.config.Name)
+	require.NotContains(t, memberNames(m1.ServiceMembers()), m3.config.Name)
+
+	// Synchronization completes (modeled after the tens-of-seconds sync), so
+	// the node marks itself ready and the change gossips across the cluster.
+	require.NoError(t, m3.SetReady(true))
+	require.True(t, m3.IsReady())
+
+	iretry.Run(t, func(r *iretry.R) {
+		for _, m := range []*Memberlist{m1, m2, m3} {
+			if !m.IsServiceable(m3.config.Name) {
+				r.Fatalf("%s never observed %s becoming serviceable",
+					m.config.Name, m3.config.Name)
+			}
+			if got := m.NumServiceMembers(); got != 3 {
+				r.Fatalf("%s expected 3 serviceable members after ready, got %d",
+					m.config.Name, got)
+			}
+		}
+	})
+
+	// Draining traffic again must remove the node from the serviceable set
+	// without removing it from the member list.
+	require.NoError(t, m3.SetReady(false))
+	iretry.Run(t, func(r *iretry.R) {
+		for _, m := range []*Memberlist{m1, m2, m3} {
+			if m.IsServiceable(m3.config.Name) {
+				r.Fatalf("%s still routed traffic to drained node %s",
+					m.config.Name, m3.config.Name)
+			}
+		}
+	})
+	require.Contains(t, memberNames(m1.Members()), m3.config.Name)
+}
+
+func memberNames(nodes []*Node) []string {
+	names := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		names = append(names, n.Name)
+	}
+	return names
+}
+
 func TestMemberlist_Join(t *testing.T) {
 	c1 := testConfig(t)
 	m1, err := Create(c1)

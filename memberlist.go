@@ -43,6 +43,13 @@ type Memberlist struct {
 	incarnation atomic.Uint32 // Local incarnation number
 	numNodes    atomic.Uint32 // Number of known nodes (estimate)
 	pushPullReq atomic.Uint32 // Number of push/pull requests
+	localReady  atomic.Bool   // Whether the local node has finished state sync
+
+	// serviceable is a cached snapshot of the nodes allowed to receive
+	// application traffic. Membership-list updates replace the pointer
+	// atomically, so request routing never has to recompute readiness for
+	// every node under nodeLock.
+	serviceable atomic.Pointer[serviceableSnapshot]
 
 	advertiseLock sync.RWMutex
 	advertiseAddr net.IP
@@ -254,6 +261,11 @@ func Create(conf *Config) (*Memberlist, error) {
 		_ = m.Shutdown()
 		return nil, err
 	}
+	// Build the initial serviceable snapshot. The local node starts not
+	// ready, so this is typically empty until SetReady is invoked.
+	m.nodeLock.RLock()
+	m.refreshServiceableLocked()
+	m.nodeLock.RUnlock()
 	m.schedule()
 	return m, nil
 }
@@ -468,6 +480,9 @@ func (m *Memberlist) setAlive() error {
 		Port:        uint16(port),
 		Meta:        meta,
 		Vsn:         m.config.BuildVsnArray(),
+		// A freshly created node has not synchronized any cluster state yet,
+		// so it must not receive application traffic until SetReady is called.
+		Ready: false,
 	}
 	m.aliveNode(&a, nil, true)
 
@@ -503,6 +518,66 @@ func (m *Memberlist) LocalNode() *Node {
 	defer m.nodeLock.RUnlock()
 	state := m.nodeMap[m.config.Name]
 	return &state.Node
+}
+
+// IsReady reports whether the local node has been marked as having completed
+// its initial state synchronization. A node that is not ready stays out of the
+// serviceable member set on every peer and must not receive application
+// traffic.
+func (m *Memberlist) IsReady() bool {
+	return m.localReady.Load()
+}
+
+// SetReady marks the local node as ready (or not) to receive application
+// traffic. Newly joined nodes start as not ready so that peers keep them in
+// the member list but do not forward requests to them while their initial
+// state synchronization is still in flight. Call SetReady(true) once that
+// synchronization finishes; call SetReady(false) to drain traffic again.
+//
+// The readiness change is gossiped to the cluster through a new alive
+// message with a bumped incarnation number.
+func (m *Memberlist) SetReady(ready bool) error {
+	if m.hasShutdown() {
+		return fmt.Errorf("memberlist: can't set readiness after shutdown")
+	}
+
+	// Swap before broadcasting so the re-advertised alive message reflects the
+	// new readiness even if it is processed locally.
+	m.localReady.Store(ready)
+
+	// Re-advertise ourselves with a new incarnation so the readiness change
+	// overrides any previously gossiped alive message.
+	var meta []byte
+	if m.config.Delegate != nil {
+		meta = m.config.Delegate.NodeMeta(MetaMaxSize)
+		if len(meta) > MetaMaxSize {
+			panic("Node meta data provided by Delegate is longer than the limit")
+		}
+	}
+
+	m.nodeLock.RLock()
+	state := m.nodeMap[m.config.Name]
+	if state == nil {
+		m.nodeLock.RUnlock()
+		return fmt.Errorf("memberlist: local node state not found")
+	}
+	addr, port := state.Addr, state.Port
+	m.nodeLock.RUnlock()
+
+	a := alive{
+		Incarnation: m.nextIncarnation(),
+		Node:        m.config.Name,
+		Addr:        addr,
+		Port:        port,
+		Meta:        meta,
+		Vsn:         m.config.BuildVsnArray(),
+		Ready:       ready,
+	}
+	// bootstrap=true marks this as a self-originated, authoritative update so
+	// it is applied locally instead of being treated as an accusation to
+	// refute (the same path setAlive and UpdateNode use).
+	m.aliveNode(&a, nil, true)
+	return nil
 }
 
 // UpdateNode is used to trigger re-advertising the local node. This is
@@ -617,6 +692,63 @@ func (m *Memberlist) Members() []*Node {
 	}
 
 	return nodes
+}
+
+// refreshServiceableLocked rebuilds the cached view of the nodes that may
+// receive application traffic. The caller must hold nodeLock (in either read
+// or write mode). The cache is only rebuilt when membership state changes, so
+// per-request routing avoids scanning and re-evaluating every known node.
+func (m *Memberlist) refreshServiceableLocked() {
+	nodes := make([]*Node, 0, len(m.nodes))
+	nodeMap := make(map[string]*Node, len(m.nodes))
+	for _, n := range m.nodes {
+		if !n.serviceable() {
+			continue
+		}
+		node := &n.Node
+		nodes = append(nodes, node)
+		nodeMap[n.Name] = node
+	}
+	m.serviceable.Store(&serviceableSnapshot{nodes: nodes, nodeMap: nodeMap})
+}
+
+// ServiceMembers returns the live nodes that are ready to receive
+// application traffic. Unlike Members, this excludes nodes that have joined
+// the cluster but not yet completed their initial state synchronization, so
+// requests routed to the returned nodes cannot hit an empty local state.
+// The node structures returned must not be modified; copy a Node first if you
+// need to change it.
+func (m *Memberlist) ServiceMembers() []*Node {
+	snap := m.serviceable.Load()
+	if snap == nil {
+		return nil
+	}
+	// Return a copy of the backing slice so callers cannot mutate the cache.
+	return append([]*Node(nil), snap.nodes...)
+}
+
+// NumServiceMembers returns the number of live nodes that are ready to
+// receive application traffic. It is served from the cached serviceability
+// snapshot, so it is safe to call on the hot request path.
+func (m *Memberlist) NumServiceMembers() int {
+	snap := m.serviceable.Load()
+	if snap == nil {
+		return 0
+	}
+	return len(snap.nodes)
+}
+
+// IsServiceable reports whether the named node is currently allowed to
+// receive application traffic. A node is not serviceable while it is unknown,
+// dead/left, or still synchronizing its initial state. The lookup is served
+// from the cached serviceability snapshot.
+func (m *Memberlist) IsServiceable(name string) bool {
+	snap := m.serviceable.Load()
+	if snap == nil {
+		return false
+	}
+	_, ok := snap.nodeMap[name]
+	return ok
 }
 
 // NumMembers returns the number of alive nodes currently known. Between
