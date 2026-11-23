@@ -38,7 +38,8 @@ const (
 	// understand version 4 or greater.
 	ProtocolVersion2Compatible = 2
 
-	ProtocolVersionMax = 5
+	// Version 6 adds cursor-based incremental state synchronization.
+	ProtocolVersionMax = 6
 )
 
 // messageType is an integer ID of a type of message that can be received
@@ -64,6 +65,7 @@ const (
 	nackRespMsg
 	hasCrcMsg
 	errMsg
+	deltaSyncMsg
 )
 
 const (
@@ -196,6 +198,22 @@ type pushNodeState struct {
 	Incarnation uint32
 	State       NodeStateType
 	Vsn         []uint8 // Protocol versions
+}
+
+type stateChange struct {
+	Seq  uint64
+	Node pushNodeState
+}
+
+type deltaSyncHeader struct {
+	Join         bool
+	FullSync     bool
+	Cursor       uint64
+	LogFirstSeq  uint64
+	LogNextSeq   uint64
+	Changes      int
+	Nodes        int
+	UserStateLen int
 }
 
 // compress is used to wrap an underlying payload
@@ -331,6 +349,64 @@ func (m *Memberlist) handleConn(conn net.Conn) {
 			m.logger.Printf("[ERR] memberlist: Failed push/pull merge: %s %s", err, LogConn(conn))
 			return
 		}
+	case deltaSyncMsg:
+		numConcurrent := m.pushPullReq.Add(1)
+		defer m.pushPullReq.Add(^uint32(0))
+
+		if numConcurrent >= maxPushPullRequests {
+			m.logger.Printf("[ERR] memberlist: Too many pending push/pull requests")
+			return
+		}
+
+		var request deltaSyncHeader
+		if err := dec.Decode(&request); err != nil {
+			m.logger.Printf("[ERR] memberlist: Failed to read delta sync request: %s %s", err, LogConn(conn))
+			return
+		}
+		requestResult, err := m.readDeltaPayload(request, bufConn, dec)
+		if err != nil {
+			m.logger.Printf("[ERR] memberlist: Failed to read delta sync state: %s %s", err, LogConn(conn))
+			return
+		}
+
+		firstSeq, nextSeq := m.stateChanges.bounds()
+		response := deltaSyncHeader{
+			Join:        request.Join,
+			Cursor:      request.Cursor,
+			LogFirstSeq: firstSeq,
+			LogNextSeq:  nextSeq,
+		}
+
+		var changes []stateChange
+		if !request.Join && !request.FullSync && request.Cursor != 0 && request.Cursor <= nextSeq && request.Cursor+1 >= firstSeq {
+			var ok bool
+			changes, ok = m.stateChanges.changesAfter(request.Cursor)
+			if !ok {
+				response.FullSync = true
+			}
+		} else {
+			response.FullSync = true
+		}
+
+		if response.FullSync {
+			m.nodeLock.RLock()
+			changes = make([]stateChange, 0, len(m.nodes))
+			for _, node := range m.nodes {
+				changes = append(changes, stateChange{Node: pushNodeStateFromNode(node)})
+			}
+			m.nodeLock.RUnlock()
+		}
+
+		if err := m.sendDeltaState(conn, response, changes, streamLabel); err != nil {
+			m.logger.Printf("[ERR] memberlist: Failed to send delta state: %s %s", err, LogConn(conn))
+			return
+		}
+
+		if err := m.mergeRemoteState(request.Join, requestResult.remoteNodes, requestResult.userState); err != nil {
+			m.logger.Printf("[ERR] memberlist: Failed delta sync merge: %s %s", err, LogConn(conn))
+			return
+		}
+
 	case pingMsg:
 		var p ping
 		if err := dec.Decode(&p); err != nil {

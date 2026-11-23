@@ -64,11 +64,14 @@ type Memberlist struct {
 	lowPriorityMsgQueue  *list.List
 	msgQueueLock         sync.Mutex
 
-	nodeLock   sync.RWMutex
-	nodes      []*nodeState          // Known nodes
-	nodeMap    map[string]*nodeState // Maps Node.Name -> NodeState
-	nodeTimers map[string]*suspicion // Maps Node.Name -> suspicion timer
-	awareness  *awareness
+	nodeLock       sync.RWMutex
+	nodes          []*nodeState          // Known nodes
+	nodeMap        map[string]*nodeState // Maps Node.Name -> NodeState
+	nodeTimers     map[string]*suspicion // Maps Node.Name -> suspicion timer
+	stateChanges   *stateChangeLog
+	syncCursors    map[string]uint64
+	syncCursorLock sync.RWMutex
+	awareness      *awareness
 
 	tickerLock sync.Mutex
 	tickers    []*time.Ticker
@@ -216,6 +219,8 @@ func newMemberlist(conf *Config) (*Memberlist, error) {
 		lowPriorityMsgQueue:  list.New(),
 		nodeMap:              make(map[string]*nodeState),
 		nodeTimers:           make(map[string]*suspicion),
+		stateChanges:         newStateChangeLog(conf.IncrementalStateLogLen),
+		syncCursors:          make(map[string]uint64),
 		awareness:            newAwareness(conf.AwarenessMaxMultiplier, conf.MetricLabels),
 		ackHandlers:          make(map[uint32]*ackHandler),
 		broadcasts:           &TransmitLimitedQueue{RetransmitMult: conf.RetransmitMult},

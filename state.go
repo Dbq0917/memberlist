@@ -670,6 +670,14 @@ func (m *Memberlist) pushPull() {
 func (m *Memberlist) pushPullNode(a Address, join bool) error {
 	defer metrics.MeasureSinceWithLabels([]string{"memberlist", "pushPullNode"}, time.Now(), m.metricLabels)
 
+	if !join && m.canIncrementalSync(a) {
+		result, err := m.sendAndReceiveDeltaState(a, join)
+		if err == nil {
+			return m.mergeRemoteState(join, result.remoteNodes, result.userState)
+		}
+		m.logger.Printf("[WARN] memberlist: Delta sync with %s failed, using full state: %s", a.Name, err)
+	}
+
 	// Attempt to send and receive with the node
 	remote, userState, err := m.sendAndReceiveState(a, join)
 	if err != nil {
@@ -1134,6 +1142,7 @@ func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
 			state.State = StateAlive
 			state.StateChange = time.Now()
 		}
+		m.appendStateChangeLocked(state)
 	}
 
 	// Update metrics
@@ -1202,6 +1211,7 @@ func (m *Memberlist) suspectNode(s *suspect) {
 	state.State = StateSuspect
 	changeTime := time.Now()
 	state.StateChange = changeTime
+	m.appendStateChangeLocked(state)
 
 	// Setup a suspicion timer. Given that we don't have any known phase
 	// relationship with our peers, we set up k such that we hit the nominal
@@ -1299,6 +1309,7 @@ func (m *Memberlist) deadNode(d *dead) {
 		state.State = StateDead
 	}
 	state.StateChange = time.Now()
+	m.appendStateChangeLocked(state)
 
 	// Notify of death
 	if m.config.Events != nil {

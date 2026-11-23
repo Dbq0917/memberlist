@@ -118,6 +118,16 @@ type Config struct {
 	// usage.
 	PushPullInterval time.Duration
 
+	// IncrementalPushPull enables cursor-based state delta sync when both
+	// peers speak protocol version 6. Joins, log gaps, and older peers still
+	// use the existing full state exchange.
+	IncrementalPushPull bool
+
+	// IncrementalStateLogLen retains state changes used by incremental sync.
+	// If a peer's cursor is older than the retained log, the peer receives a
+	// full state snapshot instead of missing changes.
+	IncrementalStateLogLen int
+
 	// ProbeInterval and ProbeTimeout are used to configure probing
 	// behavior for memberlist.
 	//

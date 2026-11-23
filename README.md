@@ -71,6 +71,20 @@ convergence rate.
 For details on all of these extensions, please read our paper "[Lifeguard : SWIM-ing with Situational Awareness](https://arxiv.org/abs/1707.00788)", along with the memberlist source.  We welcome any questions related
 to the protocol on our issue tracker.
 
+## Incremental State Sync
+
+Protocol version 6 supports cursor-based incremental state synchronization.
+When `Config.IncrementalPushPull` is enabled and both peers negotiate protocol
+version 6, periodic anti-entropy sends only membership state changes recorded
+after the peer's cursor. Each node retains up to
+`Config.IncrementalStateLogLen` changes. Joins, peers on older protocol
+versions, restarted peers, and peers whose cursor is older than the retained
+log automatically fall back to a full state snapshot, preventing missed
+updates or divergent membership views.
+
+Delegate state exposed through `LocalState` does not carry a version in the
+existing delegate API, so it is still included in full in each sync exchange.
+
 ## Metrics Emission
 
 This library emits metrics using `github.com/hashicorp/go-metrics`.
