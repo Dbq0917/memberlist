@@ -73,10 +73,26 @@ type Config struct {
 	//
 	//   Retransmits = RetransmitMult * log(N+1)
 	//
+	// When BroadcastMaxTransmits is non-zero, the result is capped by that
+	// value so per-message cost does not keep growing with cluster size.
+	//
 	// This allows the retransmits to scale properly with cluster size. The
 	// higher the multiplier, the more likely a failed broadcast is to converge
 	// at the expense of increased bandwidth.
 	RetransmitMult int
+
+	// BroadcastMaxTransmits caps the number of times a single broadcast is
+	// sent, regardless of cluster size. With duplicate suppression this makes
+	// one membership change cost O(N) cluster-wide instead of O(N log N). A
+	// zero value leaves the limit uncapped.
+	BroadcastMaxTransmits int
+
+	// BroadcastDedupWindow is how long a node remembers a logical membership
+	// broadcast. Logical duplicates received during this window are not queued
+	// again, so independent confirmations cannot reset the retransmit timer.
+	// Different incarnations, states, metadata, and leave reasons remain
+	// distinct changes. A zero value disables duplicate suppression.
+	BroadcastDedupWindow time.Duration
 
 	// SuspicionMult is the multiplier for determining the time an
 	// inaccessible node is considered suspect before declaring it dead.
@@ -257,8 +273,8 @@ type Config struct {
 	// MetricLabels is a map of optional labels to apply to all metrics emitted.
 	MetricLabels []metrics.Label
 
-	// QueueCheckInterval is the interval at which we check the message
-	// queue to apply the warning and max depth.
+	// QueueCheckInterval is the interval at which broadcast queue depth,
+	// transmission, retransmission, and suppression counters are sampled.
 	QueueCheckInterval time.Duration
 
 	// MsgpackUseNewTimeFormat when set to true, force the underlying msgpack
@@ -311,6 +327,8 @@ func DefaultLANConfig() *Config {
 		TCPTimeout:              10 * time.Second,       // Timeout after 10 seconds
 		IndirectChecks:          3,                      // Use 3 nodes for the indirect ping
 		RetransmitMult:          4,                      // Retransmit a message 4 * log(N+1) nodes
+		BroadcastMaxTransmits:   4,                      // Cap per-message sends for large clusters
+		BroadcastDedupWindow:    30 * time.Second,       // Suppress replayed membership events
 		SuspicionMult:           4,                      // Suspect a node for 4 * log(N+1) * Interval
 		SuspicionMaxTimeoutMult: 6,                      // For 10k nodes this will give a max timeout of 120 seconds
 		PushPullInterval:        30 * time.Second,       // Low frequency
@@ -353,6 +371,8 @@ func DefaultWANConfig() *Config {
 	conf.GossipNodes = 4 // Gossip less frequently, but to an additional node
 	conf.GossipInterval = 500 * time.Millisecond
 	conf.GossipToTheDeadTime = 60 * time.Second
+	conf.BroadcastMaxTransmits = 6
+	conf.BroadcastDedupWindow = 60 * time.Second
 	return conf
 }
 
@@ -388,6 +408,8 @@ func DefaultLocalConfig() *Config {
 	conf.ProbeInterval = time.Second
 	conf.GossipInterval = 100 * time.Millisecond
 	conf.GossipToTheDeadTime = 15 * time.Second
+	conf.BroadcastMaxTransmits = 4
+	conf.BroadcastDedupWindow = 15 * time.Second
 	return conf
 }
 

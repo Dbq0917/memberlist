@@ -58,6 +58,13 @@ Memberlist provides a default configuration that offers a good starting point,
 but errs on the side of caution, choosing values that are optimized for
 higher convergence at the cost of higher bandwidth usage.
 
+For large clusters, membership broadcasts are deduplicated by their logical
+state rather than by node name alone. Repeated confirmations of the same
+suspect or failure do not reset the retransmit counter, while a newer
+incarnation, metadata update, state transition, or leave remains a distinct
+change. `BroadcastMaxTransmits` bounds per-message retransmissions so one
+change costs O(N) cluster-wide instead of O(N log N).
+
 For complete documentation, see the associated [Godoc](http://godoc.org/github.com/hashicorp/memberlist).
 
 ## Protocol
@@ -74,3 +81,9 @@ to the protocol on our issue tracker.
 ## Metrics Emission
 
 This library emits metrics using `github.com/hashicorp/go-metrics`.
+
+Broadcast queue depth is emitted as `memberlist.queue.broadcasts`. The
+`memberlist.broadcast.transmits`, `memberlist.broadcast.retransmits`, and
+`memberlist.broadcast.suppressed` counters make propagation cost and duplicate
+suppression visible. The same values are available programmatically through
+`Memberlist.BroadcastQueueStats`.

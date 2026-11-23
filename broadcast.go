@@ -41,6 +41,62 @@ func (b *memberlistBroadcast) Message() []byte {
 	return b.msg
 }
 
+// Fingerprint returns an identity for the logical membership event carried by
+// the broadcast. For suspect and dead messages the sender ("From") is not part
+// of the event: every node that independently observes the same suspect or
+// failure must not cause the cluster to re-propagate another copy. Alive
+// messages include all of their state, and leaving is distinguished from a
+// failure even though both use deadMsg.
+//
+// An empty fingerprint means the broadcast should not be deduplicated. This is
+// used by tests and by callers that construct a memberlistBroadcast without an
+// encoded payload.
+func (b *memberlistBroadcast) Fingerprint() string {
+	if len(b.msg) == 0 {
+		return ""
+	}
+
+	switch messageType(b.msg[0]) {
+	case aliveMsg:
+		var a alive
+		if err := decode(b.msg[1:], &a); err != nil {
+			return string(b.msg)
+		}
+		return canonicalBroadcastFingerprint(aliveMsg, &a)
+
+	case suspectMsg:
+		var s suspect
+		if err := decode(b.msg[1:], &s); err != nil {
+			return string(b.msg)
+		}
+		s.From = ""
+		return canonicalBroadcastFingerprint(suspectMsg, &s)
+
+	case deadMsg:
+		var d dead
+		if err := decode(b.msg[1:], &d); err != nil {
+			return string(b.msg)
+		}
+		left := d.Node == d.From
+		d.From = ""
+		if left {
+			d.From = d.Node
+		}
+		return canonicalBroadcastFingerprint(deadMsg, &d)
+
+	default:
+		return string(b.msg)
+	}
+}
+
+func canonicalBroadcastFingerprint(msgType messageType, msg any) string {
+	buf, err := encode(msgType, msg, false)
+	if err != nil {
+		return ""
+	}
+	return string(buf.Bytes())
+}
+
 func (b *memberlistBroadcast) Finished() {
 	select {
 	case b.notify <- struct{}{}:

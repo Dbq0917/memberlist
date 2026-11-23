@@ -218,9 +218,13 @@ func newMemberlist(conf *Config) (*Memberlist, error) {
 		nodeTimers:           make(map[string]*suspicion),
 		awareness:            newAwareness(conf.AwarenessMaxMultiplier, conf.MetricLabels),
 		ackHandlers:          make(map[uint32]*ackHandler),
-		broadcasts:           &TransmitLimitedQueue{RetransmitMult: conf.RetransmitMult},
-		logger:               logger,
-		metricLabels:         conf.MetricLabels,
+		broadcasts: &TransmitLimitedQueue{
+			RetransmitMult: conf.RetransmitMult,
+			MaxTransmits:   conf.BroadcastMaxTransmits,
+			DedupWindow:    conf.BroadcastDedupWindow,
+		},
+		logger:       logger,
+		metricLabels: conf.MetricLabels,
 	}
 	m.broadcasts.NumNodes = func() int {
 		return m.estNumNodes()
@@ -636,6 +640,13 @@ func (m *Memberlist) NumMembers() (alive int) {
 	return
 }
 
+// BroadcastQueueStats returns a snapshot of broadcast queue activity. It can
+// be used to watch propagation cost and duplicate suppression during large
+// membership changes.
+func (m *Memberlist) BroadcastQueueStats() TransmitLimitedQueueStats {
+	return m.broadcasts.Stats()
+}
+
 // Leave will broadcast a leave message but will not shutdown the background
 // listeners, meaning the node will continue participating in gossip and state
 // updates.
@@ -787,13 +798,25 @@ func (m *Memberlist) changeNode(addr string, f func(*nodeState)) {
 // checkBroadcastQueueDepth periodically checks the size of the broadcast queue
 // to see if it is too large
 func (m *Memberlist) checkBroadcastQueueDepth() {
+	var previous TransmitLimitedQueueStats
 	for {
 		select {
 		case <-time.After(m.config.QueueCheckInterval):
-			numq := m.broadcasts.NumQueued()
-			metrics.AddSampleWithLabels([]string{"memberlist", "queue", "broadcasts"}, float32(numq), m.metricLabels)
+			stats := m.broadcasts.Stats()
+			metrics.AddSampleWithLabels([]string{"memberlist", "queue", "broadcasts"}, float32(stats.NumQueued), m.metricLabels)
+			metrics.IncrCounterWithLabels([]string{"memberlist", "broadcast", "transmits"}, counterDelta(stats.Transmits, previous.Transmits), m.metricLabels)
+			metrics.IncrCounterWithLabels([]string{"memberlist", "broadcast", "retransmits"}, counterDelta(stats.Retransmits, previous.Retransmits), m.metricLabels)
+			metrics.IncrCounterWithLabels([]string{"memberlist", "broadcast", "suppressed"}, counterDelta(stats.Suppressed, previous.Suppressed), m.metricLabels)
+			previous = stats
 		case <-m.shutdownCh:
 			return
 		}
 	}
+}
+
+func counterDelta(current, previous uint64) float32 {
+	if current < previous {
+		return float32(current)
+	}
+	return float32(current - previous)
 }

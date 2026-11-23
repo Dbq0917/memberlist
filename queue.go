@@ -4,8 +4,10 @@
 package memberlist
 
 import (
+	"container/list"
 	"math"
 	"sync"
+	"time"
 
 	"github.com/google/btree"
 )
@@ -24,11 +26,39 @@ type TransmitLimitedQueue struct {
 	// number of retransmissions attempted.
 	RetransmitMult int
 
-	mu    sync.Mutex
-	tq    *btree.BTree // stores *limitedBroadcast as btree.Item
-	tm    map[string]*limitedBroadcast
-	idGen int64
+	// MaxTransmits caps the number of times a single broadcast is sent. A
+	// zero value leaves the retransmit limit uncapped.
+	MaxTransmits int
+
+	// DedupWindow is how long the queue remembers recently accepted logical
+	// broadcasts. A duplicate received during this window is acknowledged but
+	// not queued again. A zero value disables duplicate suppression.
+	DedupWindow time.Duration
+
+	// DedupCacheSize bounds the number of remembered broadcasts. A zero value
+	// uses a conservative default when DedupWindow is enabled.
+	DedupCacheSize int
+
+	mu          sync.Mutex
+	tq          *btree.BTree // stores *limitedBroadcast as btree.Item
+	tm          map[string]*limitedBroadcast
+	idGen       int64
+	seen        map[string]*list.Element
+	seenOrder   *list.List
+	now         func() time.Time
+	transmits   uint64
+	retransmits uint64
+	suppressed  uint64
+	maxQueued   int
+	maxSent     int
 }
+
+type seenBroadcast struct {
+	key       string
+	expiresAt time.Time
+}
+
+const defaultDedupCacheSize = 4096
 
 type limitedBroadcast struct {
 	transmits int   // btree-key[0]: Number of transmissions attempted.
@@ -163,6 +193,10 @@ func (q *TransmitLimitedQueue) lazyInit() {
 	if q.tm == nil {
 		q.tm = make(map[string]*limitedBroadcast)
 	}
+	if q.seen == nil {
+		q.seen = make(map[string]*list.Element)
+		q.seenOrder = list.New()
+	}
 }
 
 // queueBroadcast is like QueueBroadcast but you can use a nonzero value for
@@ -173,6 +207,13 @@ func (q *TransmitLimitedQueue) queueBroadcast(b Broadcast, initialTransmits int)
 	defer q.mu.Unlock()
 
 	q.lazyInit()
+	now := q.nowTime()
+	if q.isDuplicateLocked(b, now) {
+		q.suppressed++
+		b.Finished()
+		return
+	}
+	q.rememberLocked(b, now)
 
 	if q.idGen == math.MaxInt64 {
 		// it's super duper unlikely to wrap around within the retransmit limit
@@ -252,6 +293,92 @@ func (q *TransmitLimitedQueue) addItem(cur *limitedBroadcast) {
 	if cur.name != "" {
 		q.tm[cur.name] = cur
 	}
+	if queued := q.tq.Len(); queued > q.maxQueued {
+		q.maxQueued = queued
+	}
+}
+
+type broadcastFingerprinter interface {
+	Fingerprint() string
+}
+
+func (q *TransmitLimitedQueue) nowTime() time.Time {
+	if q.now != nil {
+		return q.now()
+	}
+	return time.Now()
+}
+
+// isDuplicateLocked reports whether this exact logical broadcast was accepted
+// recently. A queued duplicate is not allowed to reset the original message's
+// transmit count, which is what turns independent confirmations into a storm.
+func (q *TransmitLimitedQueue) isDuplicateLocked(b Broadcast, now time.Time) bool {
+	if q.DedupWindow <= 0 {
+		return false
+	}
+	fp, ok := b.(broadcastFingerprinter)
+	if !ok {
+		return false
+	}
+	key := fp.Fingerprint()
+	if key == "" {
+		return false
+	}
+
+	q.expireSeenLocked(now)
+	_, ok = q.seen[key]
+	return ok
+}
+
+func (q *TransmitLimitedQueue) rememberLocked(b Broadcast, now time.Time) {
+	if q.DedupWindow <= 0 {
+		return
+	}
+	fp, ok := b.(broadcastFingerprinter)
+	if !ok {
+		return
+	}
+	key := fp.Fingerprint()
+	if key == "" {
+		return
+	}
+
+	q.expireSeenLocked(now)
+	if _, ok := q.seen[key]; ok {
+		return
+	}
+
+	elem := q.seenOrder.PushBack(seenBroadcast{
+		key:       key,
+		expiresAt: now.Add(q.DedupWindow),
+	})
+	q.seen[key] = elem
+
+	limit := q.DedupCacheSize
+	if limit <= 0 {
+		limit = defaultDedupCacheSize
+	}
+	for q.seenOrder.Len() > limit {
+		q.removeOldestSeenLocked()
+	}
+}
+
+func (q *TransmitLimitedQueue) expireSeenLocked(now time.Time) {
+	for q.seenOrder != nil && q.seenOrder.Len() > 0 {
+		elem := q.seenOrder.Front()
+		seen := elem.Value.(seenBroadcast)
+		if now.Before(seen.expiresAt) {
+			return
+		}
+		q.removeOldestSeenLocked()
+	}
+}
+
+func (q *TransmitLimitedQueue) removeOldestSeenLocked() {
+	elem := q.seenOrder.Front()
+	seen := elem.Value.(seenBroadcast)
+	delete(q.seen, seen.key)
+	q.seenOrder.Remove(elem)
 }
 
 // getTransmitRange returns a pair of min/max values for transmit values
@@ -283,7 +410,7 @@ func (q *TransmitLimitedQueue) GetBroadcasts(overhead, limit int) [][]byte {
 		return nil
 	}
 
-	transmitLimit := retransmitLimit(q.RetransmitMult, q.NumNodes())
+	transmitLimit := q.transmitLimit()
 
 	var (
 		bytesUsed int
@@ -338,6 +465,13 @@ func (q *TransmitLimitedQueue) GetBroadcasts(overhead, limit int) [][]byte {
 		// Add to slice to send
 		bytesUsed += overhead + len(msg)
 		toSend = append(toSend, msg)
+		q.transmits++
+		if keep.transmits > 0 {
+			q.retransmits++
+		}
+		if keep.transmits+1 > q.maxSent {
+			q.maxSent = keep.transmits + 1
+		}
 
 		// Check if we should stop transmission
 		q.deleteItem(keep)
@@ -359,6 +493,49 @@ func (q *TransmitLimitedQueue) GetBroadcasts(overhead, limit int) [][]byte {
 	}
 
 	return toSend
+}
+
+func (q *TransmitLimitedQueue) transmitLimit() int {
+	nodes := 0
+	if q.NumNodes != nil {
+		nodes = q.NumNodes()
+	}
+
+	limit := retransmitLimit(q.RetransmitMult, nodes)
+	if q.MaxTransmits > 0 && (limit <= 0 || limit > q.MaxTransmits) {
+		limit = q.MaxTransmits
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	return limit
+}
+
+// TransmitLimitedQueueStats is a snapshot of broadcast queue activity.
+type TransmitLimitedQueueStats struct {
+	NumQueued       int
+	MaxQueued       int
+	Transmits       uint64
+	Retransmits     uint64
+	Suppressed      uint64
+	MaxTransmits    int
+	RetransmitLimit int
+}
+
+// Stats returns a snapshot of queue depth and transmission counters.
+func (q *TransmitLimitedQueue) Stats() TransmitLimitedQueueStats {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	return TransmitLimitedQueueStats{
+		NumQueued:       q.lenLocked(),
+		MaxQueued:       q.maxQueued,
+		Transmits:       q.transmits,
+		Retransmits:     q.retransmits,
+		Suppressed:      q.suppressed,
+		MaxTransmits:    q.maxSent,
+		RetransmitLimit: q.transmitLimit(),
+	}
 }
 
 // NumQueued returns the number of queued messages
@@ -390,6 +567,13 @@ func (q *TransmitLimitedQueue) Reset() {
 	q.tq = nil
 	q.tm = nil
 	q.idGen = 0
+	q.seen = nil
+	q.seenOrder = nil
+	q.transmits = 0
+	q.retransmits = 0
+	q.suppressed = 0
+	q.maxQueued = 0
+	q.maxSent = 0
 }
 
 // Prune will retain the maxRetain latest messages, and the rest
