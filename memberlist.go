@@ -255,6 +255,7 @@ func Create(conf *Config) (*Memberlist, error) {
 		return nil, err
 	}
 	m.schedule()
+	m.scheduleAnnounce()
 	return m, nil
 }
 

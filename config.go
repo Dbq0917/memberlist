@@ -249,6 +249,26 @@ type Config struct {
 	// a message to that node.
 	RequireNodeNames bool
 
+	// AnnounceAddrs is an optional list of known cluster members that this
+	// node proactively reports its presence to as soon as it starts. Each
+	// address receives a direct, best-effort alive notification, so the node
+	// becomes a known member immediately instead of waiting for a gossip or
+	// push/pull round to discover it. This does not replace Join and does not
+	// perform a state exchange; passive discovery continues to work unchanged,
+	// and peers need no upgrade because the notification is an ordinary alive
+	// message. Leave this nil to preserve the previous, fully passive behavior.
+	AnnounceAddrs []string
+
+	// AnnounceRetries is the number of delivery attempts made for the
+	// startup announcement configured by AnnounceAddrs. A value of zero
+	// defaults to 3 attempts. It is ignored when AnnounceAddrs is empty.
+	AnnounceRetries int
+
+	// AnnounceInterval is the delay between announcement delivery attempts.
+	// A value of zero defaults to one second. It is ignored when
+	// AnnounceAddrs is empty.
+	AnnounceInterval time.Duration
+
 	// CIDRsAllowed If nil, allow any connection (default), otherwise specify all networks
 	// allowed to connect (you must specify IPv6/IPv4 separately)
 	// Using [] will block all connections.
