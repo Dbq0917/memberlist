@@ -131,6 +131,39 @@ type Config struct {
 	ProbeInterval time.Duration
 	ProbeTimeout  time.Duration
 
+	// MinProbeTimeout is the lower bound clamped onto the adaptive probe
+	// timeout. The effective direct-ping ack timeout is derived from the
+	// observed per-node RTT (smoothed RTT plus a variance safety margin) and
+	// clamped to the range [MinProbeTimeout, ProbeTimeout]. This lets a
+	// healthy, low-latency network detect failures much faster than the
+	// static ProbeTimeout while still giving every node a fair chance to
+	// answer. If zero, it defaults to a quarter of ProbeTimeout.
+	MinProbeTimeout time.Duration
+
+	// RTTWarmupSamples is the number of successful RTT samples required for a
+	// node before the adaptive timeout kicks in. Until then the static
+	// ProbeTimeout is used, so a node with no history is never judged on an
+	// uninitialized estimate.
+	RTTWarmupSamples int
+
+	// ProbeFailureThreshold is the number of consecutive failed probes of a
+	// node required before it is declared suspect. A value of 1 preserves the
+	// classic behavior of suspecting a node after the first failed probe. A
+	// value of 2 or 3 tolerates isolated lost packets without mistaking them
+	// for a hard failure; failed probes are retried on an accelerated
+	// cadence (see FailureProbeSpeedup), so tolerating a blip does not slow
+	// down detection of a real outage.
+	ProbeFailureThreshold int
+
+	// FailureProbeSpeedup divides ProbeInterval to derive the delay before a
+	// node that just failed a probe is re-probed. For example, with a one
+	// second ProbeInterval and a speedup of 4, a failing node is retried
+	// roughly every 250ms instead of waiting for its next turn in the normal
+	// round-robin. The effective delay is additionally bounded below by the
+	// adaptive probe timeout and above by the awareness-scaled interval. A
+	// value <= 1 disables accelerated retries.
+	FailureProbeSpeedup int
+
 	// DisableTcpPings will turn off the fallback TCP pings that are attempted
 	// if the direct UDP ping fails. These get pipelined along with the
 	// indirect UDP pings.
@@ -316,6 +349,10 @@ func DefaultLANConfig() *Config {
 		PushPullInterval:        30 * time.Second,       // Low frequency
 		ProbeTimeout:            500 * time.Millisecond, // Reasonable RTT time for LAN
 		ProbeInterval:           1 * time.Second,        // Failure check every second
+		MinProbeTimeout:         100 * time.Millisecond, // Never wait less than 100ms for an ack
+		RTTWarmupSamples:        4,                      // Adapt after 4 RTT samples
+		ProbeFailureThreshold:   2,                      // Tolerate one isolated lost probe
+		FailureProbeSpeedup:     4,                      // Retry failed nodes ~4x faster
 		DisableTcpPings:         false,                  // TCP pings are safe, even with mixed versions
 		AwarenessMaxMultiplier:  8,                      // Probe interval backs off to 8 seconds
 
@@ -350,6 +387,8 @@ func DefaultWANConfig() *Config {
 	conf.PushPullInterval = 60 * time.Second
 	conf.ProbeTimeout = 3 * time.Second
 	conf.ProbeInterval = 5 * time.Second
+	conf.MinProbeTimeout = 500 * time.Millisecond
+	conf.ProbeFailureThreshold = 2
 	conf.GossipNodes = 4 // Gossip less frequently, but to an additional node
 	conf.GossipInterval = 500 * time.Millisecond
 	conf.GossipToTheDeadTime = 60 * time.Second
@@ -386,9 +425,28 @@ func DefaultLocalConfig() *Config {
 	conf.PushPullInterval = 15 * time.Second
 	conf.ProbeTimeout = 200 * time.Millisecond
 	conf.ProbeInterval = time.Second
+	conf.MinProbeTimeout = 50 * time.Millisecond
 	conf.GossipInterval = 100 * time.Millisecond
 	conf.GossipToTheDeadTime = 15 * time.Second
 	return conf
+}
+
+// normalizeConfig fills in safe values for the adaptive probing settings when
+// a caller built a Config by hand rather than starting from one of the
+// default configurations.
+func normalizeConfig(conf *Config) {
+	if conf.MinProbeTimeout <= 0 {
+		conf.MinProbeTimeout = conf.ProbeTimeout / 4
+	}
+	if conf.RTTWarmupSamples <= 0 {
+		conf.RTTWarmupSamples = 4
+	}
+	if conf.ProbeFailureThreshold <= 0 {
+		conf.ProbeFailureThreshold = 1
+	}
+	if conf.FailureProbeSpeedup <= 0 {
+		conf.FailureProbeSpeedup = 1
+	}
 }
 
 // Returns whether or not encryption is enabled

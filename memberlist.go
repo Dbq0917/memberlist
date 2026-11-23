@@ -75,6 +75,12 @@ type Memberlist struct {
 	stopTick   chan struct{}
 	probeIndex int
 
+	// probeRetryLock guards probeRetries, which schedules accelerated
+	// re-probes of nodes whose most recent probe failed but have not yet
+	// reached the configured failure threshold.
+	probeRetryLock sync.Mutex
+	probeRetries   map[string]time.Time
+
 	ackLock     sync.Mutex
 	ackHandlers map[uint32]*ackHandler
 
@@ -98,6 +104,8 @@ func (conf *Config) BuildVsnArray() []uint8 {
 // newMemberlist creates the network listeners.
 // Does not schedule execution of background maintenance.
 func newMemberlist(conf *Config) (*Memberlist, error) {
+	normalizeConfig(conf)
+
 	if conf.ProtocolVersion < ProtocolVersionMin {
 		return nil, fmt.Errorf("protocol version '%d' too low. Must be in range: [%d, %d]",
 			conf.ProtocolVersion, ProtocolVersionMin, ProtocolVersionMax)
@@ -216,6 +224,7 @@ func newMemberlist(conf *Config) (*Memberlist, error) {
 		lowPriorityMsgQueue:  list.New(),
 		nodeMap:              make(map[string]*nodeState),
 		nodeTimers:           make(map[string]*suspicion),
+		probeRetries:         make(map[string]time.Time),
 		awareness:            newAwareness(conf.AwarenessMaxMultiplier, conf.MetricLabels),
 		ackHandlers:          make(map[uint32]*ackHandler),
 		broadcasts:           &TransmitLimitedQueue{RetransmitMult: conf.RetransmitMult},

@@ -81,6 +81,10 @@ type nodeState struct {
 	Incarnation uint32        // Last known incarnation number
 	State       NodeStateType // Current state
 	StateChange time.Time     // Time last state change happened
+
+	// health holds the per-node RTT estimate and consecutive probe failure
+	// count driving the adaptive probe timeout and the failure threshold.
+	health *probeHealth
 }
 
 // Address returns the host:port form of a node's address, suitable for use
@@ -125,24 +129,25 @@ func (m *Memberlist) schedule() {
 
 	// If we already have tickers, then don't do anything, since we're
 	// scheduled
-	if len(m.tickers) > 0 {
+	if m.stopTick != nil {
 		return
 	}
 
 	// Create the stop tick channel, a blocking channel. We close this
 	// when we should stop the tickers.
 	stopCh := make(chan struct{})
+	scheduled := false
 
 	// Create a new probeTicker
 	if m.config.ProbeInterval > 0 {
-		t := time.NewTicker(m.config.ProbeInterval)
-		go m.triggerFunc(m.config.ProbeInterval, t.C, stopCh, m.probe)
-		m.tickers = append(m.tickers, t)
+		go m.probeTrigger(stopCh)
+		scheduled = true
 	}
 
 	// Create a push pull ticker if needed
 	if m.config.PushPullInterval > 0 {
 		go m.pushPullTrigger(stopCh)
+		scheduled = true
 	}
 
 	// Create a gossip ticker if needed
@@ -150,11 +155,13 @@ func (m *Memberlist) schedule() {
 		t := time.NewTicker(m.config.GossipInterval)
 		go m.triggerFunc(m.config.GossipInterval, t.C, stopCh, m.gossip)
 		m.tickers = append(m.tickers, t)
+		scheduled = true
 	}
 
-	// If we made any tickers, then record the stopTick channel for
-	// later.
-	if len(m.tickers) > 0 {
+	// Record the stop channel if any background routine was started. The
+	// probe and push/pull loops do not own a ticker, so they are tracked
+	// separately from m.tickers.
+	if scheduled {
 		m.stopTick = stopCh
 	}
 }
@@ -206,14 +213,134 @@ func (m *Memberlist) pushPullTrigger(stop <-chan struct{}) {
 	}
 }
 
+// probeTrigger drives failure detection. Instead of a fixed-period ticker it
+// uses a self-rescheduling timer so that nodes whose last probe failed can be
+// retried on an accelerated cadence (see scheduleProbeRetry), while healthy
+// nodes keep being probed at the awareness-scaled ProbeInterval. Each wakeup
+// performs at most one probe, which keeps the loop single-threaded and
+// preserves the original round-robin behavior for healthy nodes.
+func (m *Memberlist) probeTrigger(stop <-chan struct{}) {
+	// Use a random stagger to avoid synchronizing across the cluster.
+	baseInterval := m.awareness.ScaleTimeout(m.config.ProbeInterval)
+	select {
+	case <-time.After(rand.N(baseInterval)):
+	case <-stop:
+		return
+	}
+
+	for {
+		baseInterval = m.awareness.ScaleTimeout(m.config.ProbeInterval)
+		wakeup := baseInterval
+		if retry, ok := m.takeDueProbeRetry(); ok {
+			m.probeRetryNode(retry)
+		} else {
+			m.probe()
+		}
+		if next, ok := m.nextProbeRetryDelay(); ok && next < wakeup {
+			wakeup = next
+		}
+
+		select {
+		case <-time.After(wakeup):
+		case <-stop:
+			return
+		}
+	}
+}
+
+// scheduleProbeRetry queues an accelerated re-probe of the given node. Any
+// existing entry for the node is replaced so at most one retry is pending at
+// a time.
+func (m *Memberlist) scheduleProbeRetry(nodeName string, after time.Duration) {
+	m.probeRetryLock.Lock()
+	m.probeRetries[nodeName] = time.Now().Add(after)
+	m.probeRetryLock.Unlock()
+}
+
+// cancelProbeRetry removes any pending accelerated re-probe for the node,
+// e.g. once a probe succeeds or the node has been declared dead.
+func (m *Memberlist) cancelProbeRetry(nodeName string) {
+	m.probeRetryLock.Lock()
+	delete(m.probeRetries, nodeName)
+	m.probeRetryLock.Unlock()
+}
+
+// takeDueProbeRetry returns the name of a node whose retry is due, removing
+// it from the queue. Entries whose node has disappeared or is no longer alive
+// are pruned along the way.
+func (m *Memberlist) takeDueProbeRetry() (string, bool) {
+	now := time.Now()
+
+	m.probeRetryLock.Lock()
+	defer m.probeRetryLock.Unlock()
+
+	for name, due := range m.probeRetries {
+		if due.After(now) {
+			continue
+		}
+		delete(m.probeRetries, name)
+
+		m.nodeLock.RLock()
+		state, ok := m.nodeMap[name]
+		alive := ok && !state.DeadOrLeft()
+		m.nodeLock.RUnlock()
+		if !alive {
+			continue
+		}
+		return name, true
+	}
+	return "", false
+}
+
+// nextProbeRetryDelay reports how long until the earliest pending retry
+// becomes due. It returns false if no retry is queued.
+func (m *Memberlist) nextProbeRetryDelay() (time.Duration, bool) {
+	m.probeRetryLock.Lock()
+	defer m.probeRetryLock.Unlock()
+
+	now := time.Now()
+	var soonest time.Duration
+	found := false
+	for _, due := range m.probeRetries {
+		remaining := due.Sub(now)
+		if remaining < 0 {
+			remaining = 0
+		}
+		if !found || remaining < soonest {
+			soonest = remaining
+			found = true
+		}
+	}
+	if !found {
+		return 0, false
+	}
+	return soonest, true
+}
+
+// probeRetryNode probes a node that was queued by scheduleProbeRetry.
+func (m *Memberlist) probeRetryNode(name string) {
+	m.nodeLock.RLock()
+	state, ok := m.nodeMap[name]
+	var node nodeState
+	if ok {
+		node = *state
+	}
+	m.nodeLock.RUnlock()
+	if !ok || node.DeadOrLeft() || node.Name == m.config.Name {
+		m.cancelProbeRetry(name)
+		return
+	}
+	m.probeNode(&node)
+}
+
 // Deschedule is used to stop the background maintenance. This is safe
 // to call multiple times.
 func (m *Memberlist) deschedule() {
 	m.tickerLock.Lock()
 	defer m.tickerLock.Unlock()
 
-	// If we have no tickers, then we aren't scheduled.
-	if len(m.tickers) == 0 {
+	// If nothing was scheduled, there is nothing to stop.
+	if m.stopTick == nil {
 		return
 	}
 
@@ -226,6 +353,7 @@ func (m *Memberlist) deschedule() {
 		t.Stop()
 	}
 	m.tickers = nil
+	m.stopTick = nil
 }
 
 // Tick is used to perform a single round of failure detection and gossip
@@ -304,6 +432,27 @@ func failedRemote(err error) bool {
 // probeNode handles a single round of failure checking on a node.
 func (m *Memberlist) probeNode(node *nodeState) {
 	defer metrics.MeasureSinceWithLabels([]string{"memberlist", "probeNode"}, time.Now(), m.metricLabels)
+
+	// Resolve the shared per-node probe history. The node passed in is a
+	// shallow copy, so re-read it from the node map to make sure RTT samples
+	// and consecutive failure counts persist across probes.
+	m.nodeLock.Lock()
+	sharedNode, known := m.nodeMap[node.Name]
+	var health *probeHealth
+	if known {
+		health = m.probeHealthFor(sharedNode)
+	}
+	m.nodeLock.Unlock()
+	if health == nil {
+		health = &probeHealth{}
+	}
+
+	// Adapt the direct ack timeout to the observed RTT instead of always
+	// waiting the full static ProbeTimeout.
+	directTimeout := m.config.ProbeTimeout
+	if sharedNode != nil {
+		directTimeout = m.probeTimeout(sharedNode)
+	}
 
 	// We use our health awareness to scale the overall probe interval, so we
 	// slow down if we detect problems. The ticker that calls us can handle
@@ -391,8 +540,10 @@ func (m *Memberlist) probeNode(node *nodeState) {
 	select {
 	case v := <-ackCh:
 		if v.Complete {
+			rtt := v.Timestamp.Sub(sent)
+			health.observeRTT(rtt)
+			m.cancelProbeRetry(node.Name)
 			if m.config.Ping != nil {
-				rtt := v.Timestamp.Sub(sent)
 				m.config.Ping.NotifyPingComplete(&node.Node, rtt, v.Payload)
 			}
 			return
@@ -403,7 +554,7 @@ func (m *Memberlist) probeNode(node *nodeState) {
 		if !v.Complete {
 			ackCh <- v
 		}
-	case <-time.After(m.config.ProbeTimeout):
+	case <-time.After(directTimeout):
 		// Note that we don't scale this timeout based on awareness and
 		// the health score. That's because we don't really expect waiting
 		// longer to help get UDP through. Since health does extend the
@@ -485,6 +636,11 @@ HANDLE_REMOTE_FAILURE:
 	// out first to allow the normal UDP-based acks to come in.
 	v := <-ackCh
 	if v.Complete {
+		// An indirect ack still proves the node is reachable; treat it as a
+		// successful probe so one flaky UDP path doesn't count toward the
+		// failure threshold.
+		health.observeRTT(v.Timestamp.Sub(sent))
+		m.cancelProbeRetry(node.Name)
 		return
 	}
 
@@ -494,6 +650,10 @@ HANDLE_REMOTE_FAILURE:
 	for didContact := range fallbackCh {
 		if didContact {
 			m.logger.Printf("[WARN] memberlist: Was able to connect to %s over TCP but UDP probes failed, network may be misconfigured", node.Name)
+			// TCP reachability means the node is alive; don't let a broken
+			// UDP path push a healthy node across the failure threshold.
+			health.resetFailures()
+			m.cancelProbeRetry(node.Name)
 			return
 		}
 	}
@@ -514,8 +674,25 @@ HANDLE_REMOTE_FAILURE:
 		awarenessDelta += 1
 	}
 
-	// No acks received from target, suspect it as failed.
-	m.logger.Printf("[INFO] memberlist: Suspect %s has failed, no acks received", node.Name)
+	// No acks received from target. Only escalate to suspect once the node
+	// has failed the configured number of consecutive probes; isolated lost
+	// packets are absorbed by an accelerated re-probe instead of being
+	// treated as a hard failure.
+	failures := health.recordFailure()
+	if failures < m.config.ProbeFailureThreshold {
+		retryNode := sharedNode
+		if retryNode == nil {
+			retryNode = node
+		}
+		m.scheduleProbeRetry(node.Name, m.probeRetryInterval(retryNode, probeInterval))
+		m.logger.Printf("[DEBUG] memberlist: Probe %s failed (%d/%d consecutive failures), retrying sooner",
+			node.Name, failures, m.config.ProbeFailureThreshold)
+		return
+	}
+
+	m.cancelProbeRetry(node.Name)
+	m.logger.Printf("[INFO] memberlist: Suspect %s has failed, no acks received after %d consecutive probes",
+		node.Name, failures)
 	s := suspect{Incarnation: node.Incarnation, Node: node.Name, From: m.config.Name}
 	m.suspectNode(&s)
 }
@@ -571,6 +748,7 @@ func (m *Memberlist) resetNodes() {
 
 	// Deregister the dead nodes
 	for i := deadIdx; i < len(m.nodes); i++ {
+		m.cancelProbeRetry(m.nodes[i].Name)
 		delete(m.nodeMap, m.nodes[i].Name)
 		m.nodes[i] = nil
 	}
@@ -1264,6 +1442,9 @@ func (m *Memberlist) deadNode(d *dead) {
 
 	// Clear out any suspicion timer that may be in effect.
 	delete(m.nodeTimers, d.Node)
+
+	// Stop any accelerated re-probe that was still pending.
+	m.cancelProbeRetry(d.Node)
 
 	// Ignore if node is already dead
 	if state.DeadOrLeft() {
