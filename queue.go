@@ -24,6 +24,13 @@ type TransmitLimitedQueue struct {
 	// number of retransmissions attempted.
 	RetransmitMult int
 
+	// MaxQueueSize is the maximum number of messages allowed in the queue
+	// at any one time. When enqueuing a new message would exceed this
+	// limit, the lowest-priority messages (those with the most transmits,
+	// then the smallest) are evicted and Finished. A zero value (the
+	// default) means the queue size is unlimited.
+	MaxQueueSize int
+
 	mu    sync.Mutex
 	tq    *btree.BTree // stores *limitedBroadcast as btree.Item
 	tm    map[string]*limitedBroadcast
@@ -228,6 +235,14 @@ func (q *TransmitLimitedQueue) queueBroadcast(b Broadcast, initialTransmits int)
 
 	// Append to the relevant queue.
 	q.addItem(lb)
+
+	// Enforce the capacity limit, if any, by evicting the lowest-priority
+	// messages. This is only done on the enqueue path: GetBroadcasts
+	// temporarily deletes and re-inserts messages while assembling a
+	// packet, and those transient moves must not count against the limit.
+	if q.MaxQueueSize > 0 {
+		q.pruneLocked(q.MaxQueueSize)
+	}
 }
 
 // deleteItem removes the given item from the overall datastructure. You
@@ -398,8 +413,17 @@ func (q *TransmitLimitedQueue) Prune(maxRetain int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
+	q.pruneLocked(maxRetain)
+}
+
+// pruneLocked evicts the lowest-priority messages until at most maxRetain
+// messages remain. Evicted messages are Finished so that anyone waiting on
+// them is released, and named messages are removed from the name map so a
+// later message with the same name doesn't invalidate a stale entry. You
+// must hold the mutex.
+func (q *TransmitLimitedQueue) pruneLocked(maxRetain int) {
 	// Do nothing if queue size is less than the limit
-	for q.tq.Len() > maxRetain {
+	for q.lenLocked() > maxRetain {
 		item := q.tq.Max()
 		if item == nil {
 			break

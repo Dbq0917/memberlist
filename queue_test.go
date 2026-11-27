@@ -212,6 +212,116 @@ func TestTransmitLimited_Prune(t *testing.T) {
 	}
 }
 
+// anonymousBroadcast is a Broadcast that is neither named nor unique, so
+// nothing dedups it and copies can pile up in the queue.
+type anonymousBroadcast struct {
+	msg    []byte
+	notify chan struct{}
+}
+
+func (b *anonymousBroadcast) Invalidates(other Broadcast) bool { return false }
+func (b *anonymousBroadcast) Message() []byte                  { return b.msg }
+func (b *anonymousBroadcast) Finished() {
+	select {
+	case b.notify <- struct{}{}:
+	default:
+	}
+}
+
+func TestTransmitLimited_MaxQueueSize(t *testing.T) {
+	q := &TransmitLimitedQueue{RetransmitMult: 1, NumNodes: func() int { return 10 }, MaxQueueSize: 2}
+
+	// Buffers are larger than 1 so that a duplicate Finished call on a
+	// stale entry is observable instead of being silently dropped.
+	ch1 := make(chan struct{}, 2)
+	ch2 := make(chan struct{}, 2)
+
+	// 18 bytes per message
+	q.QueueBroadcast(&memberlistBroadcast{"test", []byte("1. this is a test."), ch1})
+	q.QueueBroadcast(&memberlistBroadcast{"foo", []byte("2. this is a test."), ch2})
+	require.Equal(t, 2, q.NumQueued())
+
+	// Exceeding the capacity evicts the lowest-priority message.
+	q.QueueBroadcast(&memberlistBroadcast{"bar", []byte("3. this is a test."), nil})
+	require.Equal(t, 2, q.NumQueued())
+
+	// The evicted message is finished so its waiters are released.
+	select {
+	case <-ch1:
+	default:
+		t.Fatalf("expected finished notification")
+	}
+	select {
+	case <-ch2:
+		t.Fatalf("unexpected finished notification")
+	default:
+	}
+
+	// Re-queueing the evicted name must not finish the stale entry again:
+	// the name map entry has to be cleared on eviction.
+	q.QueueBroadcast(&memberlistBroadcast{"test", []byte("1. this is a test."), nil})
+	require.Equal(t, 2, q.NumQueued())
+	select {
+	case <-ch1:
+		t.Fatalf("finished sent to stale entry")
+	default:
+	}
+
+	// "foo" was evicted to make room for the re-queued "test".
+	select {
+	case <-ch2:
+	default:
+		t.Fatalf("expected finished notification")
+	}
+
+	dump := q.orderedView()
+	require.Equal(t, "bar", dump[0].b.(*memberlistBroadcast).node)
+	require.Equal(t, "test", dump[1].b.(*memberlistBroadcast).node)
+}
+
+func TestTransmitLimited_MaxQueueSize_Anonymous(t *testing.T) {
+	q := &TransmitLimitedQueue{RetransmitMult: 1, NumNodes: func() int { return 10 }, MaxQueueSize: 3}
+
+	var chans []chan struct{}
+	for i := 0; i < 5; i++ {
+		ch := make(chan struct{}, 1)
+		chans = append(chans, ch)
+		q.QueueBroadcast(&anonymousBroadcast{[]byte{byte(i)}, ch})
+	}
+
+	require.Equal(t, 3, q.NumQueued())
+
+	// The two oldest messages were evicted and finished.
+	for _, ch := range chans[:2] {
+		select {
+		case <-ch:
+		default:
+			t.Fatalf("expected finished notification")
+		}
+	}
+	for _, ch := range chans[2:] {
+		select {
+		case <-ch:
+			t.Fatalf("unexpected finished notification")
+		default:
+		}
+	}
+}
+
+func TestTransmitLimited_MaxQueueSize_GetBroadcasts(t *testing.T) {
+	q := &TransmitLimitedQueue{RetransmitMult: 3, NumNodes: func() int { return 10 }, MaxQueueSize: 2}
+
+	// 18 bytes per message
+	q.QueueBroadcast(&memberlistBroadcast{"test", []byte("1. this is a test."), nil})
+	q.QueueBroadcast(&memberlistBroadcast{"foo", []byte("2. this is a test."), nil})
+
+	// GetBroadcasts deletes and re-inserts messages while assembling a
+	// packet; those transient moves must not trip the capacity limit.
+	msgs := q.GetBroadcasts(2, 64)
+	require.Equal(t, 2, len(msgs))
+	require.Equal(t, 2, q.NumQueued())
+}
+
 func TestTransmitLimited_ordering(t *testing.T) {
 	q := &TransmitLimitedQueue{RetransmitMult: 1, NumNodes: func() int { return 10 }}
 
