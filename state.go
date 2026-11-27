@@ -960,6 +960,11 @@ func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
 		}
 	}
 
+	if len(a.Meta) > MetaMaxSize {
+		m.logger.Printf("[WARN] memberlist: Ignoring an alive message for '%s' (%v:%d) because meta data is too long: %d > %d bytes", a.Node, net.IP(a.Addr), a.Port, len(a.Meta), MetaMaxSize)
+		return
+	}
+
 	// Invoke the Alive delegate if any. This can be used to filter out
 	// alive messages based on custom logic. For example, using a cluster name.
 	// Using a merge delegate is not enough, as it is possible for passive
